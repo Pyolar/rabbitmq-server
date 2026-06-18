@@ -282,7 +282,6 @@ close(Error, State0 = #v1{connection = #v1_connection{timeout = Timeout}}) ->
                false -> ?CLOSING_TIMEOUT
            end,
     _TRef = erlang:send_after(Time, self(), terminate_connection),
-    maybe_release_sole_conn(State),
     ok = send_on_channel0(State, #'v1_0.close'{error = Error}, amqp10_framing),
     State#v1{connection_state = closed}.
 
@@ -310,15 +309,6 @@ wait_for_shutdown_sessions(TimerRef, #v1{tracked_channels = Channels} = State0) 
                       [?SHUTDOWN_SESSIONS_TIMEOUT, maps:values(Channels)]),
             State0
     end.
-
-maybe_release_sole_conn(#v1{connection = #v1_connection{
-                                            container_id = ContainerId,
-                                            vhost = Vhost,
-                                            sole_conn = true}})
-  when is_binary(ContainerId) andalso is_binary(Vhost) ->
-    rabbit_amqp_sole_conn:release(Vhost, ContainerId);
-maybe_release_sole_conn(_) ->
-    ok.
 
 handle_session_exit(ChannelNum, SessionPid, Reason, State0) ->
     State = untrack_channel(ChannelNum, SessionPid, State0),
@@ -592,8 +582,7 @@ handle_connection_frame(
                                               channel_max = EffectiveChannelMax,
                                               properties = Properties,
                                               timeout = ReceiveTimeoutMillis,
-                                              credential_timer = Timer,
-                                              sole_conn = HasSoleCap},
+                                              credential_timer = Timer},
                                heartbeater = Heartbeater},
             State = start_writer(State1),
             HostnameVal = case Hostname of
