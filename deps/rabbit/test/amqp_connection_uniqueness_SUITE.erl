@@ -69,7 +69,6 @@ init_per_group(Group, Config) ->
                 Config1,
                 rabbit_ct_broker_helpers:setup_steps() ++
                 rabbit_ct_client_helpers:setup_steps()),
-    ok = rpc(Config2, 0, rabbit_amqp_sole_conn, init, []),
     Config2.
 
 end_per_group(_, Config) ->

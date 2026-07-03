@@ -10,8 +10,6 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("khepri/include/khepri.hrl").
--include_lib("amqp10_common/include/amqp10_framing.hrl").
--include_lib("amqp10_common/include/amqp10_sole_conn.hrl").
 
 -compile([nowarn_export_all,
           export_all]).
@@ -21,6 +19,10 @@
 
 -import(rabbit_ct_helpers,
         [eventually/1, eventually/3]).
+
+-import(rabbit_amqp_sole_conn,
+        [get_store_id/0,
+         get_ra_system/0]).
 
 -define(VH, <<"/">>).
 -define(CID1, <<"id-1">>).
@@ -37,8 +39,6 @@ groups() ->
         refuse_connection_should_refuse_new_connection_if_conflict,
         refuse_connection_let_new_through_if_previous_died,
         close_existing_should_close_existing_connection,
-        close_connection_sends_proper_error,
-        close_connection_tolerates_timeout,
         try_put,
         khepri_put_should_override_keep_while_monitor,
         khepri_triggers,
@@ -53,6 +53,17 @@ end_per_suite(Config) ->
     Config.
 
 init_per_group(_, Config) ->
+    ok = meck:new(rabbit_nodes, [passthrough, no_link]),
+    ok = meck:expect(rabbit_nodes, list_running, fun() -> [node()] end),
+    ok = meck:new(rabbit_sup, [passthrough, no_link]),
+    ok = meck:expect(rabbit_sup, start_child,
+                     fun(rabbit_amqp_sole_conn) ->
+                             %% We use gen_server:start instead of start_link
+                             %% so it survives the death of the init_per_group process
+                             gen_server:start({local, rabbit_amqp_sole_conn},
+                                              rabbit_amqp_sole_conn, [], []),
+                             ok
+                     end),
     PrivDir = ?config(priv_dir, Config),
     DataDir = filename:join(
                 PrivDir,
@@ -62,27 +73,32 @@ init_per_group(_, Config) ->
         {error, {already_loaded, _}} -> ok
     end,
     ok = application:set_env(rabbit, data_dir, DataDir),
-    rabbit_khepri:setup(),
+    ok = application:set_env(rabbit, amqp10_sole_conn_store_id, rabbitmq_amqp10_sole_conn),
+    {ok, _} = application:ensure_all_started(khepri),
+    ok = rabbit_ra_systems:ensure_ra_system_started(get_ra_system()),
+    rabbit_amqp_sole_conn:ensure_running(),
     Config.
 
 end_per_group(_, Config) ->
-    ok = khepri:stop(rabbit_khepri:get_store_id()),
-    ok = ra_system:stop(coordination),
+    case whereis(rabbit_amqp_sole_conn) of
+        undefined ->
+            ok;
+        Pid ->
+            gen_server:stop(Pid)
+    end,
+    ok = khepri:stop(get_store_id()),
+    ok = application:stop(khepri),
+    ok = ra_system:stop(get_ra_system()),
+    ok = application:stop(ra),
+    ok = meck:unload(rabbit_sup),
+    ok = meck:unload(rabbit_nodes),
     Config.
 
 init_per_testcase(_, Config) ->
-    rabbit_amqp_sole_conn:init(),
     Config.
 
-end_per_testcase(close_existing_should_close_existing_connection, Config) ->
-    ok = khepri:delete(rabbit_khepri:get_store_id(), [?KHEPRI_ROOT_NODE]),
-    Config;
-end_per_testcase(close_connection_tolerates_timeout, Config) ->
-    ok = meck:unload(rabbit_networking),
-    ok = khepri:delete(rabbit_khepri:get_store_id(), [?KHEPRI_ROOT_NODE]),
-    Config;
 end_per_testcase(_, Config) ->
-    clean_store(),
+    clean_store_from_connections(),
     Config.
 
 refuse_connection_should_refuse_new_connection_if_conflict(_) ->
@@ -123,11 +139,11 @@ close_existing_should_close_existing_connection(_) ->
     %% 1 takes the lease
     ?assertEqual(ok, acquire(close_existing, ?VH, ?CID1, Pid1)),
     ?assertEqual({ok, rabbit_amqp_sole_conn:conn(Pid1)},
-                 rabbit_khepri:get(Path)),
+                 khepri:get(get_store_id(), Path)),
     %% 2 takes the lease from 1
     ?assertEqual(ok, acquire(close_existing, ?VH, ?CID1, Pid2)),
     ?assertEqual({ok, rabbit_amqp_sole_conn:conn(Pid2)},
-                 rabbit_khepri:get(Path)),
+                 khepri:get(get_store_id(), Path)),
     %% 1 must have received the enforcement message
     ?assertEqual(ok, receive close_sole_conn_enforcement_received -> ok
                      after 5000 -> timeout end),
@@ -136,104 +152,59 @@ close_existing_should_close_existing_connection(_) ->
 
     Pid2 ! die,
 
-    eventually(?_assertMatch({error, _}, rabbit_khepri:get(Path))),
+    eventually(?_assertMatch({error, _}, khepri:get(get_store_id(), Path))),
     ok.
 
-close_connection_sends_proper_error(_) ->
-    TestPid = self(),
-    ConnPid = spawn(fun() ->
-        receive
-            {rabbit_call, From, {close, Error}} ->
-                TestPid ! {received, Error},
-                gen:reply(From, ok)
-        after 5000 ->
-            ok
-        end
-    end),
-    ok = rabbit_amqp_sole_conn:close_connection(rabbit_amqp_sole_conn:conn(ConnPid)),
-    receive
-        {received, Error} ->
-            ?assertMatch(
-               #'v1_0.error'{
-                   condition = ?V_1_0_AMQP_ERROR_RESOURCE_LOCKED,
-                   info = {map, [{?SOLE_CONN_ENFORCEMENT, {boolean, true}}]}},
-               Error)
-    after 5000 ->
-        error(timeout)
-    end.
-
-close_connection_tolerates_timeout(_) ->
-    ok = meck:new(rabbit_networking, [passthrough]),
-    ok = meck:expect(rabbit_networking, close_connection,
-                     fun(Pid, Error, _Timeout) ->
-                         try rabbit_reader:force_close(Pid, Error, 10)
-                         catch exit:{_Reason, _Location} -> ok
-                         end
-                     end),
-    ConnPid = spawn(fun() ->
-        receive
-            %% Receive the close request but do not reply, simulating a slow connection.
-            {rabbit_call, _From, {close, _Error}} -> receive die -> ok end;
-            die -> ok
-        end
-    end),
-    %% Must return ok even when the target process does not reply within the timeout.
-    ?assertEqual(ok, rabbit_amqp_sole_conn:close_connection(
-                       rabbit_amqp_sole_conn:conn(ConnPid))),
-    ConnPid ! die.
-
 try_put(_) ->
-    %% clean the store, so the stored proc does not interfer
-    clean_store(),
     Path = rabbit_amqp_sole_conn:conn_path(?VH, ?CID1),
     Pid1 = spawn_disposable(),
     Conn1 = rabbit_amqp_sole_conn:conn(Pid1),
     %% acquire lease
     ?assertEqual(ok, acquire(refuse_connection, ?VH, ?CID1, Pid1)),
-    ?assertEqual({ok, Conn1}, rabbit_khepri:get(Path)),
-    %% simulation new incoming connection
+    ?assertEqual({ok, Conn1}, khepri:get(get_store_id(), Path)),
+    %% simulating new incoming connection
     Pid2 = spawn_disposable(),
     Conn2 = rabbit_amqp_sole_conn:conn(Pid2),
     %% new connection manages to replace old connection
     ?assertEqual(ok, rabbit_amqp_sole_conn:try_put(Path, Conn1, Conn2)),
-    ?assertEqual({ok, Conn2}, rabbit_khepri:get(Path)),
+    ?assertEqual({ok, Conn2}, khepri:get(get_store_id(), Path)),
     %% new connection arrives, but a bit slower than the second one,
     %% it still sees Conn1 in the datastore
     Pid3 = spawn_disposable(),
     Conn3 = rabbit_amqp_sole_conn:conn(Pid3),
     ?assertEqual(error, rabbit_amqp_sole_conn:try_put(Path, Conn1, Conn3)),
-    ?assertEqual({ok, Conn2}, rabbit_khepri:get(Path)),
+    ?assertEqual({ok, Conn2}, khepri:get(get_store_id(), Path)),
 
     %% can't take the lease, conn2 has it
     ?assertEqual({error, refuse_connection},
                  acquire(refuse_connection, ?VH, ?CID1, Pid1)),
     %% conn2 dies, it should release the lease
     Pid2 ! die,
-    eventually(?_assertEqual(ok, acquire(refuse_connection, ?VH, ?CID1, Pid1))),
+    %% we try to take the lease with conn3 (the other 2 connections are dead)
+    eventually(?_assertEqual(ok, acquire(refuse_connection, ?VH, ?CID1, Pid3))),
 
     Pid3 ! die,
-    Pid1 ! die,
     ok.
 
 khepri_put_should_override_keep_while_monitor(_) ->
     Pid1 = spawn_disposable(),
     Opts1 = #{keep_while => Pid1},
     Path1 = [rmq, vhosts, ?VH, sole_conn, <<"1">>],
-    ?assertMatch({ok, _}, rabbit_khepri:adv_create(Path1, Pid1, Opts1)),
-    ?assertEqual({ok, Pid1}, rabbit_khepri:get(Path1)),
+    ?assertMatch({ok, _}, khepri_adv:create(get_store_id(), Path1, Pid1, Opts1)),
+    ?assertEqual({ok, Pid1}, khepri:get(get_store_id(), Path1)),
 
     Pid2 = spawn_disposable(),
     Opts2 = #{keep_while => Pid2},
-    ?assertMatch(ok, rabbit_khepri:put(Path1, Pid2, Opts2)),
-    ?assertEqual({ok, Pid2}, rabbit_khepri:get(Path1)),
+    ?assertMatch(ok, khepri:put(get_store_id(), Path1, Pid2, Opts2)),
+    ?assertEqual({ok, Pid2}, khepri:get(get_store_id(), Path1)),
 
     %% making sure that the node does not monitor the first PID anymore
     Pid1 ! die,
     timer:sleep(500),
-    ?assertEqual({ok, Pid2}, rabbit_khepri:get(Path1)),
+    ?assertEqual({ok, Pid2}, khepri:get(get_store_id(), Path1)),
     Pid2 ! die,
     eventually(?_assertMatch({error, {khepri, node_not_found, _}},
-                             rabbit_khepri:get(Path1))),
+                             khepri:get(get_store_id(), Path1))),
     ok.
 
 khepri_triggers(_) ->
@@ -246,7 +217,7 @@ khepri_triggers(_) ->
                    Pid ! {sproc, Key, {Change, Path}}
            end,
 
-    rabbit_khepri:adv_put(StoredProcPath, Proc),
+    khepri_adv:put(get_store_id(), StoredProcPath, Proc),
 
     EventFilter = khepri_evf:tree([rmq, vhosts,
                                    ?KHEPRI_WILDCARD_STAR_STAR,
@@ -259,27 +230,27 @@ khepri_triggers(_) ->
     %% when the partition ends.
     Opts = #{where => all_members},
     ok = khepri:register_trigger(
-           rabbit_khepri:get_store_id(),
+           get_store_id(),
            sole_conn,
            EventFilter,
            StoredProcPath,
            Opts),
 
     Path1 = [rmq, vhosts, ?VH, sole_conn, <<"1">>],
-    ?assertMatch({ok, _}, rabbit_khepri:adv_create(Path1, <<"1">>)),
+    ?assertMatch({ok, _}, khepri_adv:create(get_store_id(), Path1, <<"1">>)),
 
-    ?assertMatch({ok, _}, rabbit_khepri:adv_put(Path1, <<"2">>)),
+    ?assertMatch({ok, _}, khepri_adv:put(get_store_id(), Path1, <<"2">>)),
     ?assertEqual(executed, receive_sproc_msg(Key, {update, Path1})),
 
-    ?assertMatch({ok, _}, rabbit_khepri:adv_delete(Path1)),
+    ?assertMatch({ok, _}, khepri_adv:delete(get_store_id(), Path1)),
     ?assertEqual(executed, receive_sproc_msg(Key, {delete, Path1})),
     %% the tree nodes created implictly are deleted automatically
     eventually(?_assertMatch({error, {khepri, node_not_found, _}},
-                             rabbit_khepri:get(Path1))),
+                             khepri:get(get_store_id(), Path1))),
     ok.
 
 khepri_cas(_) ->
-    StoreId = rabbit_khepri:get_store_id(),
+    StoreId = get_store_id(),
     Path = [rmq, vhosts, ?VH, sole_conn, <<"1">>],
     Pid1 = spawn_disposable(),
     Pid2 = spawn_disposable(),
@@ -288,7 +259,7 @@ khepri_cas(_) ->
     V2 = rabbit_amqp_sole_conn:conn(Pid2),
     V3 = rabbit_amqp_sole_conn:conn(Pid3),
 
-    ?assertMatch(ok, rabbit_khepri:create(Path, V1)),
+    ?assertMatch(ok, khepri:create(get_store_id(), Path, V1)),
     ?assertEqual({ok, V1}, khepri:get(StoreId, Path)),
 
     ?assertMatch(ok,
@@ -298,7 +269,7 @@ khepri_cas(_) ->
                  khepri:compare_and_swap(StoreId, Path, V1, V3)),
     ?assertEqual({ok, V2}, khepri:get(StoreId, Path)),
 
-    ?assertMatch(ok, rabbit_khepri:delete(Path)),
+    ?assertMatch(ok, khepri:delete(StoreId, Path)),
     ?assertMatch({error, _}, khepri:get(StoreId, Path)),
     ?assertMatch({error, _},
                  khepri:compare_and_swap(StoreId, Path, V1, V2)),
@@ -308,8 +279,8 @@ khepri_cas(_) ->
 %% Internal Helpers
 %% --------------------------------------------------------------
 
-clean_store() ->
-    ok = khepri:delete(rabbit_khepri:get_store_id(), [?KHEPRI_ROOT_NODE]).
+clean_store_from_connections() ->
+    ok = khepri:delete(get_store_id(), [rabbitmq, vhosts]).
 
 spawn_disposable() ->
     spawn(fun() -> receive die -> ok end end).

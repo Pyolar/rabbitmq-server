@@ -7,16 +7,41 @@
 
 -module(rabbit_amqp_sole_conn).
 
+-behaviour(gen_server).
+
 -include_lib("kernel/include/logger.hrl").
 -include_lib("khepri/include/khepri.hrl").
 -include("include/rabbit_khepri.hrl").
 -include_lib("amqp10_common/include/amqp10_sole_conn.hrl").
 -include_lib("amqp10_common/include/amqp10_framing.hrl").
 
--define(CLOSE_EXISTING_TIMEOUT, 30_000).
+-define(RA_CLUSTER_NAME, rabbitmq_amqp10_sole_conn).
+-define(STORE_ID, ?RA_CLUSTER_NAME).
+-define(RA_FRIENDLY_NAME, "AMQP Sole Conn Enforcement").
+-define(RA_SYSTEM, coordination).
+-define(DEFAULT_COMMAND_OPTIONS, #{reply_from => local}).
 -define(ALIVENESS_RPC_TIMEOUT, 1_000).
 
--export([init/0,
+-rabbit_boot_step({?MODULE,
+                   [{description, "AMQP 1.0 sole connection enforcement"},
+                    {mfa,         {?MODULE, recover, []}},
+                    {requires,    database},
+                    {enables,     pre_flight}]}).
+
+%% supervisor and gen_server callbacks
+-export([start_link/0,
+         init/1,
+         handle_call/3,
+         handle_cast/2,
+         handle_info/2,
+         terminate/2,
+         code_change/3]).
+
+-export([recover/0,
+         ensure_running/0,
+         get_ra_system/0,
+         get_store_id/0,
+         init_schema/0,
          acquire/4,
          refuse_connection_error/0,
          close_existing_connection_error/0]).
@@ -24,47 +49,180 @@
 %% for testing
 -export([conn/1,
          try_put/3,
-         conn_path/2,
-         close_connection/1]).
+         conn_path/2]).
 
 -type vhost() :: binary().
 -type container_id() :: binary().
 
 -record(conn, {pid :: pid()}).
 
-init() ->
-    _ = rabbit_khepri:adv_put(kill_connection_sproc_path(),
-                              fun kill_connection_sproc/1),
+%% --------------------------------------------------------------
+%% gen_server callbacks
+%% --------------------------------------------------------------
+
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+init([]) ->
+    erlang:send_after(10_000, self(), cluster_tick),
+    {ok, #{}}.
+
+handle_info(cluster_tick, State) ->
+    erlang:send_after(10_000, self(), cluster_tick),
+    {noreply, State};
+handle_info(Message, State) ->
+    {stop, {unhandled_info, Message}, State}.
+
+handle_call(Request, _From, State) ->
+    {stop, {unhandled_call, Request}, State}.
+
+handle_cast(Request, State) ->
+    {stop, {unhandled_cast, Request}, State}.
+
+terminate(_Reason, _State) ->
+    ok.
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+init_schema() ->
+    _ = khepri_adv:put(get_store_id(),
+                       kill_connection_sproc_path(),
+                       fun kill_connection_sproc/1,
+                       ?DEFAULT_COMMAND_OPTIONS),
 
     EventFilter = khepri_evf:tree(kill_connection_sproc_trigger_pattern(),
                                   #{on_actions => [update]}),
 
+    Opts = #{where => all_members},
     ok = khepri:register_trigger(
-           rabbit_khepri:get_store_id(),
+           get_store_id(),
            amqp10_sole_conn_kill_connection,
            EventFilter,
-           kill_connection_sproc_path()).
+           kill_connection_sproc_path(),
+           Opts).
+
+%% --------------------------------------------------------------
+%% Public API
+%% --------------------------------------------------------------
+
+recover() ->
+    LocalServerId = {get_store_id(), node()},
+    %% We ask RA to passively check the disk and restart the Khepri state machine
+    case ra:restart_server(get_ra_system(), LocalServerId) of
+        {error, not_started} ->
+            %% First boot, do nothing and wait until the first `acquire`
+            ok;
+        {error, name_not_registered} ->
+            %% First boot, do nothing and wait until the first `acquire`
+            ok;
+        _ ->
+            %% Khepri instance restarted
+            %% We can now safely start our gen_server to manage it.
+            rabbit_sup:start_child(?MODULE)
+    end.
+
+ensure_running() ->
+    case whereis(?MODULE) of
+        undefined ->
+            ?LOG_DEBUG("sole_conn not running on ~p, "
+                       "trying to acquire bootstrap lock", [node()]),
+            global:set_lock({?MODULE, bootstrap}),
+            try
+                case whereis(?MODULE) of
+                    undefined ->
+                        ?LOG_DEBUG("Starting sole_conn bootstrap sequence on ~p",
+                                   [node()]),
+                        StoreId = get_store_id(),
+
+                        %% TODO get settings from global Khepri configuration
+                        SnapshotInterval = 50000,
+                        RetryTimeout = 300_000,
+                        MachineConfig = #{snapshot_interval => SnapshotInterval},
+                        RaServerConfig = #{cluster_name => StoreId,
+                                           friendly_name => ?RA_FRIENDLY_NAME,
+                                           min_recovery_checkpoint_interval => 4096,
+                                           machine_config => MachineConfig},
+
+                        ?LOG_DEBUG("Starting ~ts Khepri store", [?RA_FRIENDLY_NAME]),
+                        %% Start local Khepri server process
+                        {ok, _} = khepri:start(coordination, RaServerConfig),
+
+                        %% Check if any other RabbitMQ nodes are already running the feature
+                        OtherNodes = rabbit_nodes:list_running() -- [node()],
+                        ?LOG_DEBUG("Other nodes in cluster: ~p", [OtherNodes]),
+                        case find_active_peer(OtherNodes) of
+                            undefined ->
+                                %% Virgin Cluster
+                                %% Wait for Raft to elect us as the leader, then strictly
+                                %% initialize the schema before proceeding.
+                                ?LOG_DEBUG("No active peer, starting new cluster"),
+                                ok = khepri_cluster:wait_for_leader(StoreId, RetryTimeout),
+                                ?LOG_DEBUG("Started new cluster, initializing schema"),
+                                init_schema(),
+                                ?LOG_DEBUG("Schema initialized");
+                            PeerNode ->
+                                %% Existing Cluster
+                                %% Join the active peer. Khepri will safely wipe any independent
+                                %% local disk state and sync with the prevailing leader.
+                                ?LOG_DEBUG("Trying to join active peer: ~p", [PeerNode]),
+                                ok = khepri_cluster:join(StoreId, PeerNode),
+                                ?LOG_DEBUG("Joined existing cluster, "
+                                           "waiting for effective behaviour"),
+                                ok = khepri_cluster:wait_for_effective_behaviour(StoreId,
+                                                                                 process_based_keep_while,
+                                                                                 RetryTimeout),
+                                ?LOG_DEBUG("Local store ready")
+                        end,
+
+                        %% Start the gen_server. This registers the local process
+                        %% name, which allows subsequent calls to bypass this setup, and
+                        %% lets other nodes discover us via find_active_peer/1.
+                        ok = rabbit_sup:start_child(?MODULE),
+                        ok;
+                    _Pid ->
+                        ?LOG_DEBUG("sole_conn has started on ~p, skipping boostrap sequence",
+                                   [node()]),
+                        ok
+                end
+            after
+                %% Lock is released even if an exception occurs
+                global:del_lock({?MODULE, bootstrap})
+            end;
+        _ ->
+            ok
+    end.
+
+get_ra_system() ->
+    ?RA_SYSTEM.
+
+get_store_id() ->
+    ?STORE_ID.
 
 -spec acquire(none | enforcement_policy(), vhost(), container_id(), pid()) ->
     ok | {error, refuse_connection | close_existing}.
 acquire(none, _, _, _) ->
     ok;
-acquire(refuse_connection = Plcy, VHost, ContainerId, ConnPid) ->
+acquire(Plcy, VHost, ContainerId, ConnPid) ->
+    ensure_running(),
+    do_acquire(Plcy, VHost, ContainerId, ConnPid).
+
+do_acquire(refuse_connection = Plcy, VHost, ContainerId, ConnPid) ->
     Path = conn_path(VHost, ContainerId),
 
     Opts = default_options(ConnPid),
     Payload = #conn{pid = ConnPid},
-    case rabbit_khepri:adv_create(Path, Payload, Opts) of
+    case khepri_adv:create(get_store_id(), Path, Payload, Opts) of
         {ok, _} ->
             %% no node yet, accept
             %% node should clean itself when the connection is closed
             ok;
         {error, {khepri, mismatching_node, #{node_props := #{data := ExistingConn}}}} ->
+            %% TODO hijack: check users are the same, if not, refuse connection
             case check_conn(ExistingConn) of
                 true ->
                     {error, refuse_connection};
                 _ ->
-                    %% TODO hijack: check users are the same, if not, refuse connection
                     case try_put(Path, ExistingConn, Payload) of
                         ok ->
                             ok;
@@ -78,13 +236,13 @@ acquire(refuse_connection = Plcy, VHost, ContainerId, ConnPid) ->
                       [ContainerId, VHost, Plcy, Reason]),
             {error, refuse_connection}
     end;
-acquire(close_existing = Plcy, VHost, ContainerId, ConnPid) ->
+do_acquire(close_existing = Plcy, VHost, ContainerId, ConnPid) ->
     Path = conn_path(VHost, ContainerId),
     Opts = default_options(ConnPid),
     Payload = #conn{pid = ConnPid},
     %% TODO hijack: try create, if created OK.
     %% if existing, check same user, if same, try CAS put, otherwise refuse
-    case rabbit_khepri:adv_put(Path, Payload, Opts) of
+    case khepri_adv:put(get_store_id(), Path, Payload, Opts) of
         {ok, _} ->
             ok;
         {error, Reason} ->
@@ -121,9 +279,26 @@ close_existing_connection_error() ->
 %% --------------------------------------------------------------
 %% Internals
 %% --------------------------------------------------------------
- 
+
+%% Iterates through peer nodes and checks if the amqp10_sole_conn process is alive.
+find_active_peer([]) ->
+    undefined;
+find_active_peer([Node | Rest]) ->
+    %% Use a fast RPC call with a 1-second timeout to avoid hanging the client
+    %% if a peer is unresponsive.
+    try erpc:call(Node, erlang, whereis, [?MODULE], 1000) of
+        Pid when is_pid(Pid) ->
+            Node;
+        _ ->
+            find_active_peer(Rest)
+    catch
+        error:{erpc, _Reason} ->
+            %% Node is unreachable or timed out, move on to the next one
+            find_active_peer(Rest)
+    end.
+
 default_options(Pid) ->
-    #{keep_while => Pid}.
+    maps:merge(?DEFAULT_COMMAND_OPTIONS, #{keep_while => Pid}).
 
 check_conn(#conn{pid = Pid}) ->
     Node = node(Pid),
@@ -147,7 +322,7 @@ try_put(Path,
         #conn{pid = ExistingPid} = ExistingConn,
         #conn{pid = NewPid} = NewConn) ->
     Opts = default_options(NewPid),
-    case khepri:compare_and_swap(store_id(), Path, ExistingConn, NewConn,
+    case khepri:compare_and_swap(get_store_id(), Path, ExistingConn, NewConn,
                                  Opts) of
         ok ->
             ok;
@@ -157,14 +332,6 @@ try_put(Path,
                          [Path, ExistingPid, NewPid, Error]),
             error
     end.
-
-close_connection(#conn{pid = Pid}) ->
-    Error = close_existing_connection_error(),
-    rabbit_networking:close_connection(Pid, Error, ?CLOSE_EXISTING_TIMEOUT).
-
-store_id() ->
-    rabbit_khepri:get_store_id().
-
 
 kill_connection_sproc(#khepri_trigger{type = tree,
                                       event = #{change := update,
