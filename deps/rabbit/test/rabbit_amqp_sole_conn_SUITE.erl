@@ -73,7 +73,6 @@ init_per_group(_, Config) ->
         {error, {already_loaded, _}} -> ok
     end,
     ok = application:set_env(rabbit, data_dir, DataDir),
-    ok = application:set_env(rabbit, amqp10_sole_conn_store_id, rabbitmq_amqp10_sole_conn),
     {ok, _} = application:ensure_all_started(khepri),
     ok = rabbit_ra_systems:ensure_ra_system_started(get_ra_system()),
     rabbit_amqp_sole_conn:ensure_running(),
