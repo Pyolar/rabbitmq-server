@@ -42,19 +42,21 @@
          get_ra_system/0,
          get_store_id/0,
          init_schema/0,
-         acquire/4,
+         acquire/5,
          refuse_connection_error/0,
          close_existing_connection_error/0]).
 
 %% for testing
--export([conn/1,
+-export([conn/2,
          try_put/3,
          conn_path/2]).
 
 -type vhost() :: binary().
 -type container_id() :: binary().
+-type username() :: binary().
 
--record(conn, {pid :: pid()}).
+-record(conn, {pid :: pid(),
+               username :: username()}).
 
 %% --------------------------------------------------------------
 %% gen_server callbacks
@@ -199,36 +201,42 @@ get_ra_system() ->
 get_store_id() ->
     ?STORE_ID.
 
--spec acquire(none | enforcement_policy(), vhost(), container_id(), pid()) ->
+-spec acquire(none | enforcement_policy(), vhost(), container_id(), username(), pid()) ->
     ok | {error, refuse_connection | close_existing}.
-acquire(none, _, _, _) ->
+acquire(none, _, _, _, _) ->
     ok;
-acquire(Plcy, VHost, ContainerId, ConnPid) ->
+acquire(Plcy, VHost, ContainerId, Username, ConnPid) ->
     ensure_running(),
-    do_acquire(Plcy, VHost, ContainerId, ConnPid).
+    do_acquire(Plcy, VHost, ContainerId, Username, ConnPid).
 
-do_acquire(refuse_connection = Plcy, VHost, ContainerId, ConnPid) ->
+do_acquire(refuse_connection = Plcy, VHost, ContainerId, Username, ConnPid) ->
     Path = conn_path(VHost, ContainerId),
 
     Opts = default_options(ConnPid),
-    Payload = #conn{pid = ConnPid},
+    Payload = #conn{pid = ConnPid, username = Username},
     case khepri_adv:create(get_store_id(), Path, Payload, Opts) of
         {ok, _} ->
             %% no node yet, accept
             %% node should clean itself when the connection is closed
             ok;
         {error, {khepri, mismatching_node, #{node_props := #{data := ExistingConn}}}} ->
-            %% TODO hijack: check users are the same, if not, refuse connection
-            case check_conn(ExistingConn) of
+            %% Only the same user may take over a dead connection's lease;
+            %% a different user is refused outright, aliveness notwithstanding.
+            case same_user(ExistingConn, Username) of
                 true ->
-                    {error, refuse_connection};
-                _ ->
-                    case try_put(Path, ExistingConn, Payload) of
-                        ok ->
-                            ok;
+                    case check_conn(ExistingConn) of
+                        true ->
+                            {error, refuse_connection};
                         _ ->
-                            {error, refuse_connection}
-                    end
+                            case try_put(Path, ExistingConn, Payload) of
+                                ok ->
+                                    ok;
+                                _ ->
+                                    {error, refuse_connection}
+                            end
+                    end;
+                false ->
+                    {error, refuse_connection}
             end;
         {error, Reason} ->
             ?LOG_INFO("Unexpected Khepri error for connection '~ts' "
@@ -236,15 +244,27 @@ do_acquire(refuse_connection = Plcy, VHost, ContainerId, ConnPid) ->
                       [ContainerId, VHost, Plcy, Reason]),
             {error, refuse_connection}
     end;
-do_acquire(close_existing = Plcy, VHost, ContainerId, ConnPid) ->
+do_acquire(close_existing = Plcy, VHost, ContainerId, Username, ConnPid) ->
     Path = conn_path(VHost, ContainerId),
     Opts = default_options(ConnPid),
-    Payload = #conn{pid = ConnPid},
-    %% TODO hijack: try create, if created OK.
-    %% if existing, check same user, if same, try CAS put, otherwise refuse
-    case khepri_adv:put(get_store_id(), Path, Payload, Opts) of
+    Payload = #conn{pid = ConnPid, username = Username},
+    case khepri_adv:create(get_store_id(), Path, Payload, Opts) of
         {ok, _} ->
             ok;
+        {error, {khepri, mismatching_node, #{node_props := #{data := ExistingConn}}}} ->
+            %% A different user may not close and replace someone else's
+            %% connection: that would be a container ID hijack.
+            case same_user(ExistingConn, Username) of
+                true ->
+                    case try_put(Path, ExistingConn, Payload) of
+                        ok ->
+                            ok;
+                        _ ->
+                            {error, refuse_connection}
+                    end;
+                false ->
+                    {error, refuse_connection}
+            end;
         {error, Reason} ->
             ?LOG_INFO("Unexpected Khepri error for connection '~ts' "
                       "in vhost ~ts (policy ~ts): ~p. Refusing connection.",
@@ -300,6 +320,9 @@ find_active_peer([Node | Rest]) ->
 default_options(Pid) ->
     maps:merge(?DEFAULT_COMMAND_OPTIONS, #{keep_while => Pid}).
 
+same_user(#conn{username = ExistingUsername}, Username) ->
+    ExistingUsername =:= Username.
+
 check_conn(#conn{pid = Pid}) ->
     Node = node(Pid),
     case Node =:= node() of
@@ -351,8 +374,8 @@ amqp_error(Cond, Desc, Info) ->
        info = {map, [Info]}}.
 
 %% for testing
-conn(Pid) ->
-    #conn{pid = Pid}.
+conn(Pid, Username) ->
+    #conn{pid = Pid, username = Username}.
 
 %% --------------------------------------------------------------
 %% Khepri paths

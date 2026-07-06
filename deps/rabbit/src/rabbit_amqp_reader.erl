@@ -496,7 +496,7 @@ handle_connection_frame(
                            none
                    end,
 
-    case rabbit_amqp_sole_conn:acquire(SoleConnPlcy, Vhost, ContainerId, self()) of
+    case rabbit_amqp_sole_conn:acquire(SoleConnPlcy, Vhost, ContainerId, Username, self()) of
         {error, refuse_connection} ->
             %% "If the enforcing container has not already sent the open
             %% for the connection, it MUST add the property

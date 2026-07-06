@@ -10,6 +10,7 @@
 -define(CID1, <<"id-1">>).
 -define(CID2, <<"id-2">>).
 -define(CID3, <<"id-3">>).
+-define(USER, <<"user-1">>).
 
 -define(LOGFMT_CONFIG, #{legacy_header => false,
                          single_line => false,
@@ -110,7 +111,7 @@ lazy_cluster_formation(Config) ->
     
     ct:pal("Triggering acquire/4 on Node 1 (~p)", [Node1]),
     Pid1 = call(Config, Node1, erlang, spawn, [fun() -> receive die -> ok end end]),
-    ok = call(Config, Node1, rabbit_amqp_sole_conn, acquire, [refuse_connection, ?VH, ?CID1, Pid1]),
+    ok = call(Config, Node1, rabbit_amqp_sole_conn, acquire, [refuse_connection, ?VH, ?CID1, ?USER, Pid1]),
     
     %% Verify Node 1 is the sole member
     {ok, Members1} = call(Config, Node1, khepri_cluster, members, [?STORE_ID]),
@@ -118,7 +119,7 @@ lazy_cluster_formation(Config) ->
     
     ct:pal("Triggering acquire/4 on Node 2 (~p)", [Node2]),
     Pid2 = call(Config, Node2, erlang, spawn, [fun() -> receive die -> ok end end]),
-    ok = call(Config, Node2, rabbit_amqp_sole_conn, acquire, [refuse_connection, ?VH, ?CID2, Pid2]),
+    ok = call(Config, Node2, rabbit_amqp_sole_conn, acquire, [refuse_connection, ?VH, ?CID2, ?USER, Pid2]),
     
     %% Verify Node 2 joined the cluster
     {ok, Members2} = call(Config, Node2, khepri_cluster, members, [?STORE_ID]),
@@ -126,7 +127,7 @@ lazy_cluster_formation(Config) ->
     
     ct:pal("Triggering acquire/4 on Node 3 (~p)", [Node3]),
     Pid3 = call(Config, Node3, erlang, spawn, [fun() -> receive die -> ok end end]),
-    ok = call(Config, Node3, rabbit_amqp_sole_conn, acquire, [refuse_connection, ?VH, ?CID3, Pid3]),
+    ok = call(Config, Node3, rabbit_amqp_sole_conn, acquire, [refuse_connection, ?VH, ?CID3, ?USER, Pid3]),
     
     %% Verify all 3 nodes are in the cluster
     {ok, Members3} = call(Config, Node3, khepri_cluster, members, [?STORE_ID]),

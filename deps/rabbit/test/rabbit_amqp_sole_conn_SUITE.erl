@@ -15,7 +15,7 @@
           export_all]).
 
 -import(rabbit_amqp_sole_conn,
-        [acquire/4]).
+        [acquire/5]).
 
 -import(rabbit_ct_helpers,
         [eventually/1, eventually/3]).
@@ -26,6 +26,8 @@
 
 -define(VH, <<"/">>).
 -define(CID1, <<"id-1">>).
+-define(USER1, <<"user-1">>).
+-define(USER2, <<"user-2">>).
 
 all() ->
     [
@@ -38,7 +40,9 @@ groups() ->
       [
         refuse_connection_should_refuse_new_connection_if_conflict,
         refuse_connection_let_new_through_if_previous_died,
+        refuse_connection_should_refuse_different_user_even_if_existing_dead,
         close_existing_should_close_existing_connection,
+        close_existing_should_refuse_different_user_and_not_kill_existing,
         try_put,
         khepri_put_should_override_keep_while_monitor,
         khepri_triggers,
@@ -102,23 +106,45 @@ end_per_testcase(_, Config) ->
 
 refuse_connection_should_refuse_new_connection_if_conflict(_) ->
     Pid1 = spawn_disposable(),
-    ?assertEqual(ok, acquire(refuse_connection, ?VH, ?CID1, Pid1)),
+    ?assertEqual(ok, acquire(refuse_connection, ?VH, ?CID1, ?USER1, Pid1)),
     Pid2 = spawn_disposable(),
     ?assertEqual({error, refuse_connection},
-                 acquire(refuse_connection, ?VH, ?CID1, Pid2)),
+                 acquire(refuse_connection, ?VH, ?CID1, ?USER1, Pid2)),
     Pid2 ! die,
     Pid1 ! die,
     ok.
 
 refuse_connection_let_new_through_if_previous_died(_) ->
     Pid1 = spawn_disposable(),
-    ?assertEqual(ok, acquire(refuse_connection, ?VH, ?CID1, Pid1)),
+    ?assertEqual(ok, acquire(refuse_connection, ?VH, ?CID1, ?USER1, Pid1)),
     ?assertEqual({error, refuse_connection},
-                 acquire(refuse_connection, ?VH, ?CID1, self())),
+                 acquire(refuse_connection, ?VH, ?CID1, ?USER1, self())),
     Pid1 ! die,
     eventually(?_assertNot(is_process_alive(Pid1))),
     Pid2 = spawn_disposable(),
-    ?assertEqual(ok, acquire(refuse_connection, ?VH, ?CID1, Pid2)),
+    ?assertEqual(ok, acquire(refuse_connection, ?VH, ?CID1, ?USER1, Pid2)),
+    Pid2 ! die,
+    ok.
+
+refuse_connection_should_refuse_different_user_even_if_existing_dead(_) ->
+    Path = rabbit_amqp_sole_conn:conn_path(?VH, ?CID1),
+    Pid1 = spawn_disposable(),
+    Pid1 ! die,
+    eventually(?_assertNot(is_process_alive(Pid1))),
+    %% insert the stale entry directly, without keep_while, so that it
+    %% deterministically survives Pid1's death for this test
+    Conn1 = rabbit_amqp_sole_conn:conn(Pid1, ?USER1),
+    ?assertMatch({ok, _}, khepri_adv:create(get_store_id(), Path, Conn1)),
+
+    %% a different user must be refused, even though the existing
+    %% connection is dead: aliveness is only checked for the same user
+    ?assertEqual({error, refuse_connection},
+                 acquire(refuse_connection, ?VH, ?CID1, ?USER2, self())),
+    ?assertEqual({ok, Conn1}, khepri:get(get_store_id(), Path)),
+
+    %% the original user can still take over the dead connection's lease
+    Pid2 = spawn_disposable(),
+    ?assertEqual(ok, acquire(refuse_connection, ?VH, ?CID1, ?USER1, Pid2)),
     Pid2 ! die,
     ok.
 
@@ -136,12 +162,12 @@ close_existing_should_close_existing_connection(_) ->
                  end),
     Pid2 = spawn_disposable(),
     %% 1 takes the lease
-    ?assertEqual(ok, acquire(close_existing, ?VH, ?CID1, Pid1)),
-    ?assertEqual({ok, rabbit_amqp_sole_conn:conn(Pid1)},
+    ?assertEqual(ok, acquire(close_existing, ?VH, ?CID1, ?USER1, Pid1)),
+    ?assertEqual({ok, rabbit_amqp_sole_conn:conn(Pid1, ?USER1)},
                  khepri:get(get_store_id(), Path)),
     %% 2 takes the lease from 1
-    ?assertEqual(ok, acquire(close_existing, ?VH, ?CID1, Pid2)),
-    ?assertEqual({ok, rabbit_amqp_sole_conn:conn(Pid2)},
+    ?assertEqual(ok, acquire(close_existing, ?VH, ?CID1, ?USER1, Pid2)),
+    ?assertEqual({ok, rabbit_amqp_sole_conn:conn(Pid2, ?USER1)},
                  khepri:get(get_store_id(), Path)),
     %% 1 must have received the enforcement message
     ?assertEqual(ok, receive close_sole_conn_enforcement_received -> ok
@@ -154,33 +180,56 @@ close_existing_should_close_existing_connection(_) ->
     eventually(?_assertMatch({error, _}, khepri:get(get_store_id(), Path))),
     ok.
 
+close_existing_should_refuse_different_user_and_not_kill_existing(_) ->
+    Path = rabbit_amqp_sole_conn:conn_path(?VH, ?CID1),
+    Pid1 = spawn_disposable(),
+    Pid2 = spawn_disposable(),
+    %% 1 takes the lease
+    ?assertEqual(ok, acquire(close_existing, ?VH, ?CID1, ?USER1, Pid1)),
+    %% a different user must be refused, 1 must be left untouched
+    ?assertEqual({error, refuse_connection},
+                 acquire(close_existing, ?VH, ?CID1, ?USER2, Pid2)),
+    ?assert(is_process_alive(Pid1)),
+    ?assertEqual({ok, rabbit_amqp_sole_conn:conn(Pid1, ?USER1)},
+                 khepri:get(get_store_id(), Path)),
+    %% the original user can still close and replace its own connection
+    Pid3 = spawn_disposable(),
+    ?assertEqual(ok, acquire(close_existing, ?VH, ?CID1, ?USER1, Pid3)),
+    eventually(?_assertNot(is_process_alive(Pid1))),
+    ?assertEqual({ok, rabbit_amqp_sole_conn:conn(Pid3, ?USER1)},
+                 khepri:get(get_store_id(), Path)),
+
+    Pid2 ! die,
+    Pid3 ! die,
+    ok.
+
 try_put(_) ->
     Path = rabbit_amqp_sole_conn:conn_path(?VH, ?CID1),
     Pid1 = spawn_disposable(),
-    Conn1 = rabbit_amqp_sole_conn:conn(Pid1),
+    Conn1 = rabbit_amqp_sole_conn:conn(Pid1, ?USER1),
     %% acquire lease
-    ?assertEqual(ok, acquire(refuse_connection, ?VH, ?CID1, Pid1)),
+    ?assertEqual(ok, acquire(refuse_connection, ?VH, ?CID1, ?USER1, Pid1)),
     ?assertEqual({ok, Conn1}, khepri:get(get_store_id(), Path)),
     %% simulating new incoming connection
     Pid2 = spawn_disposable(),
-    Conn2 = rabbit_amqp_sole_conn:conn(Pid2),
+    Conn2 = rabbit_amqp_sole_conn:conn(Pid2, ?USER1),
     %% new connection manages to replace old connection
     ?assertEqual(ok, rabbit_amqp_sole_conn:try_put(Path, Conn1, Conn2)),
     ?assertEqual({ok, Conn2}, khepri:get(get_store_id(), Path)),
     %% new connection arrives, but a bit slower than the second one,
     %% it still sees Conn1 in the datastore
     Pid3 = spawn_disposable(),
-    Conn3 = rabbit_amqp_sole_conn:conn(Pid3),
+    Conn3 = rabbit_amqp_sole_conn:conn(Pid3, ?USER1),
     ?assertEqual(error, rabbit_amqp_sole_conn:try_put(Path, Conn1, Conn3)),
     ?assertEqual({ok, Conn2}, khepri:get(get_store_id(), Path)),
 
     %% can't take the lease, conn2 has it
     ?assertEqual({error, refuse_connection},
-                 acquire(refuse_connection, ?VH, ?CID1, Pid1)),
+                 acquire(refuse_connection, ?VH, ?CID1, ?USER1, Pid1)),
     %% conn2 dies, it should release the lease
     Pid2 ! die,
     %% we try to take the lease with conn3 (the other 2 connections are dead)
-    eventually(?_assertEqual(ok, acquire(refuse_connection, ?VH, ?CID1, Pid3))),
+    eventually(?_assertEqual(ok, acquire(refuse_connection, ?VH, ?CID1, ?USER1, Pid3))),
 
     Pid3 ! die,
     ok.
@@ -254,9 +303,9 @@ khepri_cas(_) ->
     Pid1 = spawn_disposable(),
     Pid2 = spawn_disposable(),
     Pid3 = spawn_disposable(),
-    V1 = rabbit_amqp_sole_conn:conn(Pid1),
-    V2 = rabbit_amqp_sole_conn:conn(Pid2),
-    V3 = rabbit_amqp_sole_conn:conn(Pid3),
+    V1 = rabbit_amqp_sole_conn:conn(Pid1, ?USER1),
+    V2 = rabbit_amqp_sole_conn:conn(Pid2, ?USER1),
+    V3 = rabbit_amqp_sole_conn:conn(Pid3, ?USER1),
 
     ?assertMatch(ok, khepri:create(get_store_id(), Path, V1)),
     ?assertEqual({ok, V1}, khepri:get(StoreId, Path)),
