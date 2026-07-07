@@ -5,6 +5,7 @@
 
 -compile([nowarn_export_all, export_all]).
 
+-define(SOLE_CONN_MOD, rabbit_amqp_sole_conn).
 -define(STORE_ID, rabbit_amqp_sole_conn:get_store_id()).
 -define(VH, <<"/">>).
 -define(CID1, <<"id-1">>).
@@ -55,8 +56,8 @@ init_per_testcase(Testcase, Config0) ->
             %% Mock rabbit_sup to bypass RabbitMQ boot
             call(Config1, Node, meck, new, [rabbit_sup, [passthrough, no_link]]),
             call(Config1, Node, meck, expect, [rabbit_sup, start_child, 
-                fun(rabbit_amqp_sole_conn) ->
-                    gen_server:start({local, rabbit_amqp_sole_conn}, rabbit_amqp_sole_conn, [], []),
+                fun(?SOLE_CONN_MOD) ->
+                    gen_server:start({local, ?SOLE_CONN_MOD}, ?SOLE_CONN_MOD, [], []),
                     ok
                 end]),
                 
@@ -73,7 +74,7 @@ end_per_testcase(_Testcase, Config) ->
         fun({Node, _Peer}) ->
             %% Stop the gen_server safely
             call(Config, Node, erlang, apply, [fun() -> 
-                case whereis(rabbit_amqp_sole_conn) of
+                case whereis(?SOLE_CONN_MOD) of
                     undefined -> ok;
                     Pid -> gen_server:stop(Pid)
                 end
@@ -111,7 +112,7 @@ lazy_cluster_formation(Config) ->
     
     ct:pal("Triggering acquire/4 on Node 1 (~p)", [Node1]),
     Pid1 = call(Config, Node1, erlang, spawn, [fun() -> receive die -> ok end end]),
-    ok = call(Config, Node1, rabbit_amqp_sole_conn, acquire, [refuse_connection, ?VH, ?CID1, ?USER, Pid1]),
+    ok = acq_ref_conn(Config, Node1, ?VH, ?CID1, ?USER, Pid1),
     
     %% Verify Node 1 is the sole member
     {ok, Members1} = call(Config, Node1, khepri_cluster, members, [?STORE_ID]),
@@ -119,7 +120,7 @@ lazy_cluster_formation(Config) ->
     
     ct:pal("Triggering acquire/4 on Node 2 (~p)", [Node2]),
     Pid2 = call(Config, Node2, erlang, spawn, [fun() -> receive die -> ok end end]),
-    ok = call(Config, Node2, rabbit_amqp_sole_conn, acquire, [refuse_connection, ?VH, ?CID2, ?USER, Pid2]),
+    ok = acq_ref_conn(Config, Node2, ?VH, ?CID2, ?USER, Pid2),
     
     %% Verify Node 2 joined the cluster
     {ok, Members2} = call(Config, Node2, khepri_cluster, members, [?STORE_ID]),
@@ -127,16 +128,21 @@ lazy_cluster_formation(Config) ->
     
     ct:pal("Triggering acquire/4 on Node 3 (~p)", [Node3]),
     Pid3 = call(Config, Node3, erlang, spawn, [fun() -> receive die -> ok end end]),
-    ok = call(Config, Node3, rabbit_amqp_sole_conn, acquire, [refuse_connection, ?VH, ?CID3, ?USER, Pid3]),
+    ok = acq_ref_conn(Config, Node3, ?VH, ?CID3, ?USER, Pid3),
     
     %% Verify all 3 nodes are in the cluster
     {ok, Members3} = call(Config, Node3, khepri_cluster, members, [?STORE_ID]),
     ?assertEqual(3, length(Members3)),
 
+    %% Simulate a conflict with a connection on node 1
+    Pid4 = call(Config, Node3, erlang, spawn, [fun() -> receive die -> ok end end]),
+    {error, refuse_connection} = acq_ref_conn(Config, Node3, ?VH, ?CID1, ?USER, Pid4),
+
     %% Cleanup the dummy processes
     call(Config, Node1, erlang, exit, [Pid1, kill]),
     call(Config, Node2, erlang, exit, [Pid2, kill]),
     call(Config, Node3, erlang, exit, [Pid3, kill]),
+    call(Config, Node3, erlang, exit, [Pid4, kill]),
     ok.
 
 %% --------------------------------------------------------------
@@ -200,6 +206,10 @@ stop_erlang_node(Config, Node) ->
         undefined -> ok;
         Peer -> peer:stop(Peer)
     end.
+
+acq_ref_conn(Config, Node, VH, CID, Username, Pid) ->
+    call(Config, Node, ?SOLE_CONN_MOD, acquire,
+         [refuse_connection, VH, CID, Username, Pid]).
 
 call(Config, Node, Module, Func, Args) ->
     Nodes = ?config(peer_nodes, Config),
