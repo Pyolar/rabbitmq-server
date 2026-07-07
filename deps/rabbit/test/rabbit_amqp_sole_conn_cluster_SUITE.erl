@@ -23,7 +23,8 @@ all() ->
 groups() ->
     [{default_group, [], [
         lazy_cluster_formation,
-        restarted_node_rejoins_cluster
+        node_rejoins_cluster_after_graceful_shutdown,
+        node_rejoins_cluster_after_abrupt_shutdown
     ]}].
 
 init_per_suite(Config) ->
@@ -104,7 +105,7 @@ lazy_cluster_formation(Config) ->
     ok = acq_ref_conn(Config, Node1, ?VH, ?CID1, ?USER, Pid1),
     
     %% Verify Node 1 is the sole member
-    {ok, Members1} = call(Config, Node1, khepri_cluster, members, [?STORE_ID]),
+    Members1 = kh_members(Config, Node1),
     ?assertEqual(1, length(Members1)),
     
     ct:pal("Triggering acquire/4 on Node 2 (~p)", [Node2]),
@@ -112,7 +113,7 @@ lazy_cluster_formation(Config) ->
     ok = acq_ref_conn(Config, Node2, ?VH, ?CID2, ?USER, Pid2),
     
     %% Verify Node 2 joined the cluster
-    {ok, Members2} = call(Config, Node2, khepri_cluster, members, [?STORE_ID]),
+    Members2 = kh_members(Config, Node2),
     ?assertEqual(2, length(Members2)),
     
     ct:pal("Triggering acquire/4 on Node 3 (~p)", [Node3]),
@@ -120,7 +121,7 @@ lazy_cluster_formation(Config) ->
     ok = acq_ref_conn(Config, Node3, ?VH, ?CID3, ?USER, Pid3),
     
     %% Verify all 3 nodes are in the cluster
-    {ok, Members3} = call(Config, Node3, khepri_cluster, members, [?STORE_ID]),
+    Members3 = kh_members(Config, Node3),
     ?assertEqual(3, length(Members3)),
 
     %% Simulate a conflict with a connection on node 1
@@ -134,7 +135,7 @@ lazy_cluster_formation(Config) ->
     call(Config, Node3, erlang, exit, [Pid4, kill]),
     ok.
 
-restarted_node_rejoins_cluster(Config0) ->
+node_rejoins_cluster_after_graceful_shutdown(Config0) ->
     Nodes = ?config(peer_nodes, Config0),
     [Node1, Node2, Node3] = [N || {N, _Peer} <- Nodes],
 
@@ -163,17 +164,66 @@ restarted_node_rejoins_cluster(Config0) ->
     Config1 = lists:keyreplace(peer_nodes, 1, Config0, {peer_nodes, NewNodes}),
 
     %% Execute the boot step recovery natively
-    ct:pal("Executing ensure_running/0 on Node 3"),
-    ok = call(Config1, Node3, ?SOLE_CONN_MOD, ensure_running, []),
+    ct:pal("Executing recover/0 on Node 3"),
+    ok = call(Config1, Node3, ?SOLE_CONN_MOD, recover, []),
 
     %% Verify Node 3 is fully operational and rejoined
     %% Check that the gen_server successfully started
     RecoveredPid = call(Config1, Node3, erlang, whereis, [?SOLE_CONN_MOD]),
     ?assert(is_pid(RecoveredPid)),
 
-    %% Query the cluster members from the recovered node to prove Raft synchronization
-    {ok, RecoveredMembers} = call(Config1, Node3, khepri_cluster, members, [?STORE_ID]),
+    RecoveredMembers = kh_members(Config1, Node3),
+    ct:pal("Members: ~p", [RecoveredMembers]),
     ?assertEqual(3, length(RecoveredMembers)),
+
+    %% Cleanup the dummy processes
+    call(Config1, Node1, erlang, exit, [Pid1, kill]),
+    call(Config1, Node2, erlang, exit, [Pid2, kill]),
+    %% (Pid3 was naturally killed when Node3 was stopped)
+    ok.
+
+node_rejoins_cluster_after_abrupt_shutdown(Config0) ->
+    Nodes = ?config(peer_nodes, Config0),
+    [Node1, Node2, Node3] = [N || {N, _Peer} <- Nodes],
+
+    %% Form the initial cluster and write data
+    Pid1 = call(Config0, Node1, erlang, spawn, [fun() -> receive die -> ok end end]),
+    ok = acq_ref_conn(Config0, Node1, ?VH, ?CID1, ?USER, Pid1),
+    Pid2 = call(Config0, Node2, erlang, spawn, [fun() -> receive die -> ok end end]),
+    ok = acq_ref_conn(Config0, Node2, ?VH, ?CID2, ?USER, Pid2),
+    Pid3 = call(Config0, Node3, erlang, spawn, [fun() -> receive die -> ok end end]),
+    ok = acq_ref_conn(Config0, Node3, ?VH, ?CID3, ?USER, Pid3),
+
+    %% Stop Node 3 to simulate a crash/shutdown
+    ct:pal("Stopping Node 3 (~p)", [Node3]),
+    stop_erlang_node(Config0, Node3),
+
+    %% Restart Node 3 (which re-uses the same on-disk DataDir)
+    ct:pal("Restarting Node 3 (~p)", [Node3]),
+    NewPeer3 = restart_node(Node3, Config0),
+
+    %% Update the Config so call/5 uses the new control PID for Node 3
+    NewNodes = lists:keyreplace(Node3, 1, Nodes, {Node3, NewPeer3}),
+    Config1 = lists:keyreplace(peer_nodes, 1, Config0, {peer_nodes, NewNodes}),
+
+    %% Execute the boot step recovery natively
+    ct:pal("Executing recover/0 on Node 3"),
+    ok = call(Config1, Node3, ?SOLE_CONN_MOD, recover, []),
+
+    %% gen_server should not have been restarted
+    ?assertEqual(
+       undefined,
+       call(Config1, Node3, erlang, whereis, [?SOLE_CONN_MOD])
+    ),
+
+    CurrentMembers = kh_members(Config1, Node1),
+    ct:pal("Members: ~p", [CurrentMembers]),
+
+    %% Make sure restarted node works
+    Pid4 = call(Config1, Node3, erlang, spawn, [fun() -> receive die -> ok end end]),
+    ok = acq_ref_conn(Config1, Node3, ?VH, ?CID3, ?USER, Pid4),
+    %% Make sure the system detects a conflict
+    {error, refuse_connection} = acq_ref_conn(Config1, Node1, ?VH, ?CID3, ?USER, Pid1),
 
     %% Cleanup the dummy processes
     call(Config1, Node1, erlang, exit, [Pid1, kill]),
@@ -291,6 +341,10 @@ setup_mocks(Config, Node) ->
 node_names(Config) ->
     Nodes = ?config(peer_nodes, Config),
     [Node || {Node, _Peer} <- Nodes].
+
+kh_members(Config, Node) ->
+    {ok, Members} = call(Config, Node, khepri_cluster, members, [?STORE_ID]),
+    Members.
 
 acq_ref_conn(Config, Node, VH, CID, Username, Pid) ->
     call(Config, Node, ?SOLE_CONN_MOD, acquire,

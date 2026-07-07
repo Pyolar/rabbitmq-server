@@ -135,62 +135,7 @@ ensure_running() ->
             try
                 case whereis(?MODULE) of
                     undefined ->
-                        ?LOG_DEBUG("Starting sole_conn bootstrap sequence on ~p",
-                                   [node()]),
-                        StoreId = get_store_id(),
-
-                        %% TODO get settings from global Khepri configuration
-                        SnapshotInterval = 50000,
-                        RetryTimeout = 300_000,
-                        MachineConfig = #{snapshot_interval => SnapshotInterval},
-                        RaServerConfig = #{cluster_name => StoreId,
-                                           friendly_name => ?RA_FRIENDLY_NAME,
-                                           min_recovery_checkpoint_interval => 4096,
-                                           machine_config => MachineConfig},
-
-                        ?LOG_DEBUG("Starting ~ts Khepri store", [?RA_FRIENDLY_NAME]),
-                        {ok, _} = khepri:start(?RA_SYSTEM, RaServerConfig),
-
-                        %% Check if we just booted a virgin node or recovered data
-                        case khepri:is_empty(StoreId) of
-                            true ->
-                                %% Virgin bootstrap
-                                OtherNodes = rabbit_nodes:list_running() -- [node()],
-                                ?LOG_DEBUG("Other nodes in cluster: ~p", [OtherNodes]),
-                                case find_active_peer(OtherNodes) of
-                                    undefined ->
-                                        %% Virgin Cluster
-                                        ?LOG_DEBUG("No active peer, starting new cluster"),
-                                        ok = khepri_cluster:wait_for_leader(StoreId, RetryTimeout),
-                                        ?LOG_DEBUG("Started new cluster, initializing schema"),
-                                        init_schema(),
-                                        ?LOG_DEBUG("Schema initialized");
-                                    PeerNode ->
-                                        %% Existing Cluster
-                                        ?LOG_DEBUG("Trying to join active peer: ~p", [PeerNode]),
-                                        ok = khepri_cluster:join(StoreId, PeerNode),
-                                        ?LOG_DEBUG("Joined existing cluster, "
-                                                   "waiting for effective behaviour"),
-                                        ok = khepri_cluster:wait_for_effective_behaviour(
-                                               StoreId, process_based_keep_while, RetryTimeout),
-                                        ?LOG_DEBUG("Local store ready")
-                                end;
-                            false ->
-                                %% Recovery
-                                %% The node already has data, meaning it was part of a cluster.
-                                %% It natively rejoins the Raft consensus group.
-                                ?LOG_DEBUG("sole_conn store recovered from disk. Skipping discovery. "
-                                           "Waiting for effective behaviour."),
-                                ok = khepri_cluster:wait_for_effective_behaviour(
-                                       StoreId, process_based_keep_while, RetryTimeout),
-                                ?LOG_DEBUG("Local store ready")
-                        end,
-
-                        %% Start the gen_server. This registers the local process
-                        %% name, which allows subsequent calls to bypass this setup, and
-                        %% lets other nodes discover us via find_active_peer/1.
-                        ok = rabbit_sup:start_child(?MODULE),
-                        ok;
+                        start_local_store(); 
                     _Pid ->
                         ?LOG_DEBUG("sole_conn has started on ~p, skipping bootstrap sequence",
                                    [node()]),
@@ -203,6 +148,82 @@ ensure_running() ->
         _ ->
             ok
     end.
+
+start_local_store() ->
+    ?LOG_DEBUG("Starting sole_conn bootstrap sequence on ~p",
+               [node()]),
+    StoreId = get_store_id(),
+
+    %% TODO get settings from global Khepri configuration
+    SnapshotInterval = 50000,
+    RetryTimeout = 300_000,
+    MachineConfig = #{snapshot_interval => SnapshotInterval},
+    RaServerConfig = #{cluster_name => StoreId,
+                       friendly_name => ?RA_FRIENDLY_NAME,
+                       min_recovery_checkpoint_interval => 4096,
+                       machine_config => MachineConfig},
+
+    ?LOG_DEBUG("Starting ~ts Khepri store", [?RA_FRIENDLY_NAME]),
+    {ok, _} = khepri:start(?RA_SYSTEM, RaServerConfig),
+
+    %% Check if we just booted a virgin node or recovered data
+    case khepri:is_empty(StoreId) of
+        true ->
+            %% Virgin bootstrap
+            OtherNodes = rabbit_nodes:list_running() -- [node()],
+            ?LOG_DEBUG("Other nodes in cluster: ~p", [OtherNodes]),
+            case find_active_peer(OtherNodes) of
+                undefined ->
+                    %% Virgin Cluster
+                    ?LOG_DEBUG("No active peer, starting new cluster"),
+                    ok = khepri_cluster:wait_for_leader(StoreId, RetryTimeout),
+                    ?LOG_DEBUG("Started new cluster, initializing schema"),
+                    init_schema(),
+                    ?LOG_DEBUG("Schema initialized");
+                PeerNode ->
+                    %% Existing Cluster
+                    ?LOG_DEBUG("Trying to join active peer: ~p", [PeerNode]),
+                    case khepri_cluster:join(StoreId, PeerNode) of
+                        ok ->
+                            ok;
+                        {error, _Reason} ->
+                            %% A violent crash may have wiped our local metadata,
+                            %% but the remote cluster still remembers our old ghost identity.
+                            %% We must forcibly evict our ghost from the active peer and retry.
+                            ?LOG_DEBUG("Join failed, attempting to evict ghost identity from ~p", [PeerNode]),
+                            TargetRaftNode = {StoreId, PeerNode},
+                            GhostIdentity = {StoreId, node()},
+
+                            %% Ask the active peer's RA server to remove our old identity
+                            _ = erpc:call(PeerNode, ra, remove_member,
+                                          [TargetRaftNode, GhostIdentity, RetryTimeout]),
+
+                            %% Retry the join now that the cluster views us as a clean slate
+                            ?LOG_DEBUG("Ghost evicted. Retrying join..."),
+                            ok = khepri_cluster:join(StoreId, PeerNode)
+                    end,
+
+                    ?LOG_DEBUG("Joined existing cluster, waiting for effective behaviour"),
+                    ok = khepri_cluster:wait_for_effective_behaviour(
+                           StoreId, process_based_keep_while, RetryTimeout),
+                    ?LOG_DEBUG("Local store ready")
+            end;
+        false ->
+            %% Recovery
+            %% The node already has data, meaning it was part of a cluster.
+            %% It natively rejoins the Raft consensus group.
+            ?LOG_DEBUG("sole_conn store recovered from disk. Skipping discovery. "
+                       "Waiting for effective behaviour."),
+            ok = khepri_cluster:wait_for_effective_behaviour(
+                   StoreId, process_based_keep_while, RetryTimeout),
+            ?LOG_DEBUG("Local store ready")
+    end,
+
+    %% Start the gen_server. This registers the local process
+    %% name, which allows subsequent calls to bypass this setup, and
+    %% lets other nodes discover us via find_active_peer/1.
+    ok = rabbit_sup:start_child(?MODULE),
+    ok.
 
 get_ra_system() ->
     ?RA_SYSTEM.
