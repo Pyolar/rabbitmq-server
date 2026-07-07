@@ -111,14 +111,18 @@ init_schema() ->
 recover() ->
     LocalServerId = {get_store_id(), node()},
     %% We ask RA to passively check the disk and restart the Khepri state machine
+    ?LOG_DEBUG("Trying to restart local sole_conn RA server on ~p", [node()]),
     case ra:restart_server(get_ra_system(), LocalServerId) of
         {error, not_started} ->
+            ?LOG_DEBUG("not_started, will start on demand"),
             %% First boot, do nothing and wait until the first `acquire`
             ok;
         {error, name_not_registered} ->
+            ?LOG_DEBUG("name_not_registered, will start on demand"),
             %% First boot, do nothing and wait until the first `acquire`
             ok;
         _ ->
+            ?LOG_DEBUG("Restarted local sole_conn RA server on ~p", [node()]),
             %% Khepri instance restarted
             %% We can now safely start our gen_server to manage it.
             rabbit_sup:start_child(?MODULE)
@@ -147,33 +151,40 @@ ensure_running() ->
                                            machine_config => MachineConfig},
 
                         ?LOG_DEBUG("Starting ~ts Khepri store", [?RA_FRIENDLY_NAME]),
-                        %% Start local Khepri server process
-                        {ok, _} = khepri:start(coordination, RaServerConfig),
+                        {ok, _} = khepri:start(?RA_SYSTEM, RaServerConfig),
 
-                        %% Check if any other RabbitMQ nodes are already running the feature
-                        OtherNodes = rabbit_nodes:list_running() -- [node()],
-                        ?LOG_DEBUG("Other nodes in cluster: ~p", [OtherNodes]),
-                        case find_active_peer(OtherNodes) of
-                            undefined ->
-                                %% Virgin Cluster
-                                %% Wait for Raft to elect us as the leader, then strictly
-                                %% initialize the schema before proceeding.
-                                ?LOG_DEBUG("No active peer, starting new cluster"),
-                                ok = khepri_cluster:wait_for_leader(StoreId, RetryTimeout),
-                                ?LOG_DEBUG("Started new cluster, initializing schema"),
-                                init_schema(),
-                                ?LOG_DEBUG("Schema initialized");
-                            PeerNode ->
-                                %% Existing Cluster
-                                %% Join the active peer. Khepri will safely wipe any independent
-                                %% local disk state and sync with the prevailing leader.
-                                ?LOG_DEBUG("Trying to join active peer: ~p", [PeerNode]),
-                                ok = khepri_cluster:join(StoreId, PeerNode),
-                                ?LOG_DEBUG("Joined existing cluster, "
-                                           "waiting for effective behaviour"),
-                                ok = khepri_cluster:wait_for_effective_behaviour(StoreId,
-                                                                                 process_based_keep_while,
-                                                                                 RetryTimeout),
+                        %% Check if we just booted a virgin node or recovered data
+                        case khepri:is_empty(StoreId) of
+                            true ->
+                                %% Virgin bootstrap
+                                OtherNodes = rabbit_nodes:list_running() -- [node()],
+                                ?LOG_DEBUG("Other nodes in cluster: ~p", [OtherNodes]),
+                                case find_active_peer(OtherNodes) of
+                                    undefined ->
+                                        %% Virgin Cluster
+                                        ?LOG_DEBUG("No active peer, starting new cluster"),
+                                        ok = khepri_cluster:wait_for_leader(StoreId, RetryTimeout),
+                                        ?LOG_DEBUG("Started new cluster, initializing schema"),
+                                        init_schema(),
+                                        ?LOG_DEBUG("Schema initialized");
+                                    PeerNode ->
+                                        %% Existing Cluster
+                                        ?LOG_DEBUG("Trying to join active peer: ~p", [PeerNode]),
+                                        ok = khepri_cluster:join(StoreId, PeerNode),
+                                        ?LOG_DEBUG("Joined existing cluster, "
+                                                   "waiting for effective behaviour"),
+                                        ok = khepri_cluster:wait_for_effective_behaviour(
+                                               StoreId, process_based_keep_while, RetryTimeout),
+                                        ?LOG_DEBUG("Local store ready")
+                                end;
+                            false ->
+                                %% Recovery
+                                %% The node already has data, meaning it was part of a cluster.
+                                %% It natively rejoins the Raft consensus group.
+                                ?LOG_DEBUG("sole_conn store recovered from disk. Skipping discovery. "
+                                           "Waiting for effective behaviour."),
+                                ok = khepri_cluster:wait_for_effective_behaviour(
+                                       StoreId, process_based_keep_while, RetryTimeout),
                                 ?LOG_DEBUG("Local store ready")
                         end,
 
@@ -183,7 +194,7 @@ ensure_running() ->
                         ok = rabbit_sup:start_child(?MODULE),
                         ok;
                     _Pid ->
-                        ?LOG_DEBUG("sole_conn has started on ~p, skipping boostrap sequence",
+                        ?LOG_DEBUG("sole_conn has started on ~p, skipping bootstrap sequence",
                                    [node()]),
                         ok
                 end
