@@ -112,13 +112,11 @@ recover() ->
     LocalServerId = {get_store_id(), node()},
     %% We ask RA to passively check the disk and restart the Khepri state machine
     ?LOG_DEBUG("Trying to restart local sole_conn RA server on ~p", [node()]),
+
     case ra:restart_server(get_ra_system(), LocalServerId) of
-        {error, not_started} ->
-            ?LOG_DEBUG("not_started, will start on demand"),
-            %% First boot, do nothing and wait until the first `acquire`
-            ok;
-        {error, name_not_registered} ->
-            ?LOG_DEBUG("name_not_registered, will start on demand"),
+        {error, Reason} when Reason == not_started;
+                             Reason == name_not_registered ->
+            ?LOG_DEBUG("~p, will start on demand", [Reason]),
             %% First boot, do nothing and wait until the first `acquire`
             ok;
         _ ->

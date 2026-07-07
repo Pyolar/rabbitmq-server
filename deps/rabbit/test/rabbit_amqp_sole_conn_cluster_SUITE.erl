@@ -47,25 +47,13 @@ end_per_group(default_group, Config) ->
 
 init_per_testcase(Testcase, Config0) ->
     Nodes = start_n_nodes(Testcase, 3, Config0),
-    NodeNames = [Node || {Node, _Peer} <- Nodes],
     ct:pal("Started peer nodes ~p", [Nodes]),
     
     Config1 = [{peer_nodes, Nodes} | Config0],
     
     lists:foreach(
         fun({Node, _Peer}) ->
-            %% Mock rabbit_sup to bypass RabbitMQ boot
-            call(Config1, Node, meck, new, [rabbit_sup, [passthrough, no_link]]),
-            call(Config1, Node, meck, expect, [rabbit_sup, start_child, 
-                fun(?SOLE_CONN_MOD) ->
-                    gen_server:start({local, ?SOLE_CONN_MOD}, ?SOLE_CONN_MOD, [], []),
-                    ok
-                end]),
-                
-            %% Mock rabbit_nodes to return our 3 peers
-            call(Config1, Node, meck, new, [rabbit_nodes, [passthrough, no_link]]),
-            call(Config1, Node, meck, expect, [rabbit_nodes, list_running, 
-                fun() -> NodeNames end])
+            setup_mocks(Config1, Node)
         end, Nodes),
     Config1.
 
@@ -213,9 +201,6 @@ start_epmd() ->
     ok.
 
 start_n_nodes(Prefix, Count, Config) ->
-    PrivDir = ?config(priv_dir, Config),
-    CodePath = code:get_path(),
-    
     Nodes = [begin
                  Name = list_to_atom(lists:flatten(
                                        io_lib:format("~s-~s-~b",
@@ -226,67 +211,47 @@ start_n_nodes(Prefix, Count, Config) ->
 
     lists:foreach(
         fun({Node, Peer}) ->
-            peer:call(Peer, code, add_pathsz, [CodePath]),
-            
-            %% Setup a unique DataDir for this specific peer
-            DataDir = filename:join(PrivDir, rabbit_misc:format("data-~ts", [Node])),
-            filelib:ensure_dir(filename:join(DataDir, "dummy")),
-            
-            %% Setup correct log routing for CT reports natively in the peer
-            peer:call(Peer, ?MODULE, setup_node, [], infinity),
-            
-            %% Load the rabbit application and set the env variables
-            case peer:call(Peer, application, load, [rabbit]) of
-                ok                           -> ok;
-                {error, {already_loaded, _}} -> ok
-            end,
-            ct:pal("Using data_dir ~p for node ~p", [DataDir, Node]),
-            ok = peer:call(Peer, application, set_env, [rabbit, data_dir, DataDir]),
-            
-            %% Start the dependencies
-            {ok, _} = peer:call(Peer, application, ensure_all_started, [khepri]),
-            ok = peer:call(Peer, rabbit_ra_systems, ensure_ra_system_started, [coordination])
+            ok = init_node({Node, Peer}, Config)
         end, Nodes),
     Nodes.
 
-%% Restarts an existing node using its exact previous short-name and DataDir,
-%% and re-establishes the test mocks for the new VM.
-restart_node(Node, Config) ->
+init_node({Node, Peer}, Config) ->
     PrivDir = ?config(priv_dir, Config),
     CodePath = code:get_path(),
-    %% peer:start/1 expects a short name (e.g. 'node_1'), not the full node address.
-    %% We split the existing atom 'node_1@hostname' to extract just the short name.
-    [ShortName, _Host] = string:split(atom_to_list(Node), "@"),
-    Name = list_to_atom(ShortName),
 
-    {ok, Peer, Node} = peer:start(#{name => Name, connection => standard_io}),
+    %% Setup a unique DataDir for this specific peer
+    DataDir = filename:join(PrivDir, rabbit_misc:format("data-~ts", [Node])),
+    filelib:ensure_dir(filename:join(DataDir, "dummy")),
 
-    %% Re-inject paths and setup logging
     peer:call(Peer, code, add_pathsz, [CodePath]),
     peer:call(Peer, ?MODULE, setup_node, [], infinity),
-    %% Re-bind the exact same DataDir to trigger RA disk recovery
-    DataDir = filename:join(PrivDir, rabbit_misc:format("data-~ts", [Node])),
+    %% Load the rabbit application and set the env variables
     case peer:call(Peer, application, load, [rabbit]) of
         ok                           -> ok;
         {error, {already_loaded, _}} -> ok
     end,
     ct:pal("Using data_dir ~p for node ~p", [DataDir, Node]),
     ok = peer:call(Peer, application, set_env, [rabbit, data_dir, DataDir]),
-    %% Start dependencies
+
+    %% Start the dependencies
     {ok, _} = peer:call(Peer, application, ensure_all_started, [khepri]),
     ok = peer:call(Peer, rabbit_ra_systems, ensure_ra_system_started, [coordination]),
-    %% Re-establish all mocks on the fresh VM
-    Nodes = ?config(peer_nodes, Config),
-    NodeNames = [N || {N, _P} <- Nodes],
-    peer:call(Peer, meck, new, [rabbit_sup, [passthrough, no_link]]),
-    peer:call(Peer, meck, expect, [rabbit_sup, start_child,
-        fun(?SOLE_CONN_MOD) ->
-            gen_server:start({local, ?SOLE_CONN_MOD}, ?SOLE_CONN_MOD, [], []),
-            ok
-        end]),
-    peer:call(Peer, meck, new, [rabbit_nodes, [passthrough, no_link]]),
-    peer:call(Peer, meck, expect, [rabbit_nodes, list_running,
-        fun() -> NodeNames end]),
+    ok.
+
+
+
+%% Restarts an existing node using its exact previous short-name and DataDir,
+%% and re-establishes the test mocks for the new VM.
+restart_node(Node, Config) ->
+    %% peer:start/1 expects a short name (e.g. 'node_1'), not the full node address.
+    %% We split the existing atom 'node_1@hostname' to extract just the short name.
+    [ShortName, _Host] = string:split(atom_to_list(Node), "@"),
+    Name = list_to_atom(ShortName),
+
+    {ok, Peer, Node} = peer:start(#{name => Name, connection => standard_io}),
+    ok = init_node({Node, Peer}, Config),
+
+    setup_mocks(Config, Node),
     Peer.
 
 stop_erlang_node(Config, Node) ->
@@ -305,6 +270,27 @@ stop_erlang_node(Config, Node) ->
                     end
             end
     end.
+
+setup_mocks(Config, Node) ->
+    %% Mock rabbit_sup to bypass RabbitMQ boot
+    call(Config, Node, meck, new, [rabbit_sup, [passthrough, no_link]]),
+    call(Config, Node, meck, expect,
+         [rabbit_sup, start_child,
+          fun(?SOLE_CONN_MOD) ->
+                  gen_server:start({local, ?SOLE_CONN_MOD},
+                                   ?SOLE_CONN_MOD, [], []),
+                  ok
+          end]),
+
+    NodeNames = node_names(Config),
+    %% Mock rabbit_nodes to return our 3 peers
+    call(Config, Node, meck, new, [rabbit_nodes, [passthrough, no_link]]),
+    call(Config, Node, meck, expect, [rabbit_nodes, list_running,
+                                      fun() -> NodeNames end]).
+
+node_names(Config) ->
+    Nodes = ?config(peer_nodes, Config),
+    [Node || {Node, _Peer} <- Nodes].
 
 acq_ref_conn(Config, Node, VH, CID, Username, Pid) ->
     call(Config, Node, ?SOLE_CONN_MOD, acquire,
