@@ -19,6 +19,7 @@
 -define(STORE_ID, ?RA_CLUSTER_NAME).
 -define(RA_FRIENDLY_NAME, "AMQP Sole Conn Enforcement").
 -define(RA_SYSTEM, coordination).
+-define(TRIGGER_ID, amqp10_sole_conn_kill_connection).
 -define(DEFAULT_COMMAND_OPTIONS, #{reply_from => local}).
 -define(ALIVENESS_RPC_TIMEOUT, 1_000).
 -define(TICK_INTERVAL, 30_000).
@@ -41,6 +42,7 @@
 %% lifecycle and store management
 -export([recover/0,
          ensure_running/0,
+         stop/0,
          get_ra_system/0,
          get_store_id/0]).
 
@@ -110,7 +112,7 @@ code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
 %% --------------------------------------------------------------
-%% Cluster Resizing (Tick)
+%% Lifecycle and store management
 %% --------------------------------------------------------------
 
 is_leader() ->
@@ -160,6 +162,16 @@ maybe_resize_cluster() ->
                             ?LOG_INFO("~ts: RabbitMQ node ~w was formally removed from the cluster, "
                                       "evicting it from the sole_conn Khepri cluster",
                                       [?MODULE, Old]),
+                            %% Precaution: Safely stop the gen_server on the
+                            %% target node if it is still reachable
+                            try
+                                erpc:cast(Old, ?MODULE, stop, [])
+                            catch
+                                Cl:Rsn ->
+                                    ?LOG_DEBUG("~ts: Could not stop sole_conn gen_server on node ~w. "
+                                               "Error: ~p:~p",
+                                               [?MODULE, Old, Cl, Rsn])
+                            end,
                             LeaderId = {StoreId, node()},
                             ToRemove = {StoreId, Old},
                             %% Safely remove from quorum and clean up
@@ -178,6 +190,12 @@ maybe_resize_cluster() ->
             ok
     end.
 
+stop() ->
+    ?LOG_DEBUG("Stopping sole_conn gen_server and "
+               "removing from supervision tree on ~p", [node()]),
+    _ = rabbit_sup:stop_child(?MODULE),
+    ok.
+
 init_schema() ->
     _ = khepri_adv:put(get_store_id(),
                        kill_connection_sproc_path(),
@@ -190,7 +208,7 @@ init_schema() ->
     Opts = #{where => all_members},
     ok = khepri:register_trigger(
            get_store_id(),
-           amqp10_sole_conn_kill_connection,
+           ?TRIGGER_ID,
            EventFilter,
            kill_connection_sproc_path(),
            Opts).

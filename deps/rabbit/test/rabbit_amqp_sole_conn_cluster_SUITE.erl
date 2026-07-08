@@ -25,6 +25,7 @@ groups() ->
     [{default_group, [], [
         lazy_cluster_formation,
         cluster_should_grow_with_tick,
+        cluster_should_shrink_with_tick,
         node_rejoins_cluster_after_graceful_shutdown,
         node_rejoins_cluster_after_abrupt_shutdown
     ]}].
@@ -51,24 +52,14 @@ end_per_group(default_group, Config) ->
 init_per_testcase(Testcase, Config0) ->
     Nodes = start_n_nodes(Testcase, ?NODE_COUNT, Config0),
     ct:pal("Started peer nodes ~p", [Nodes]),
-    
+
     Config1 = [{peer_nodes, Nodes} | Config0],
-    
+
     lists:foreach(
-        fun({Node, _Peer}) ->
-            setup_mocks(Config1, Node)
-        end, Nodes),
-    case Testcase of
-        cluster_should_grow_with_tick ->
-            lists:foreach(
-              fun({_Node, Peer}) ->
-                      ok = peer:call(Peer, application,
-                                     set_env,
-                                     [rabbit, amqp10_sole_conn_tick_interval, 1000])
-              end, Nodes);
-        _ ->
-            ok
-    end,
+      fun({Node, _Peer}) ->
+              setup_mocks(Config1, Node)
+      end, Nodes),
+    maybe_set_tick_interval(Testcase, Config1),
     Config1.
 
 end_per_testcase(_Testcase, Config) ->
@@ -104,6 +95,20 @@ end_per_testcase(_Testcase, Config) ->
             ok = stop_erlang_node(Config, Node)
         end, Nodes),
     Config.
+
+maybe_set_tick_interval(Testcase, Config)
+  when Testcase == cluster_should_grow_with_tick
+       orelse Testcase == cluster_should_shrink_with_tick ->
+    Nodes = ?config(peer_nodes, Config),
+    lists:foreach(
+      fun({_Node, Peer}) ->
+              ok = peer:call(Peer, application,
+                             set_env,
+                             [rabbit, amqp10_sole_conn_tick_interval, 1000])
+      end, Nodes),
+    ok;
+maybe_set_tick_interval(_, _) ->
+    ok.
 
 %% -------------------------------------------------------------------
 %% Tests
@@ -179,6 +184,53 @@ cluster_should_grow_with_tick(Config) ->
     kill_disposable(Config, Node2, Pid2),
     kill_disposable(Config, Node3, Pid3),
     kill_disposable(Config, Node3, Pid4),
+    ok.
+
+cluster_should_shrink_with_tick(Config) ->
+    Nodes = ?config(peer_nodes, Config),
+    [Node1, Node2, Node3] = [N || {N, _Peer} <- Nodes],
+
+    %% Bootstrap and grow the cluster to 3 nodes
+    ct:pal("Triggering acquire/4 on Node 1 (~p)", [Node1]),
+    Pid1 = spawn_disposable(Config, Node1),
+    ok = acq_ref_conn(Config, Node1, ?VH, ?CID1, ?USER, Pid1),
+
+    %% Wait until all nodes join
+    rabbit_ct_helpers:eventually(?_assertEqual(?NODE_COUNT, length(kh_members(Config, Node1))),
+                                 1000, 10),
+
+    %% Check node 2 is working as expected
+    Pid2 = spawn_disposable(Config, Node2),
+    ok = acq_ref_conn(Config, Node1, ?VH, ?CID2, ?USER, Pid2),
+
+    %% Simulate 'rabbitmqctl forget_cluster_node' for Node 3
+    ct:pal("Simulating formal removal of Node 3 (~p)", [Node3]),
+    ReducedNodes = [Node1, Node2],
+    lists:foreach(
+        fun({Node, _Peer}) ->
+            %% Dynamically update the mock to pretend Node 3 was permanently removed
+            call(Config, Node, meck, expect, [rabbit_nodes, list_members, fun() -> ReducedNodes end]),
+            call(Config, Node, meck, expect, [rabbit_nodes, list_running, fun() -> ReducedNodes end])
+        end, Nodes),
+
+    %% Wait for the leader's tick to detect the change and evict Node 3
+    ct:pal("Waiting for tick to evict Node 3"),
+    rabbit_ct_helpers:eventually(?_assertEqual(2, length(kh_members(Config, Node1))),
+                                 1000, 10),
+
+    %% Verify Node 3 is actually gone from Khepri
+    CurrentMembers = kh_members(Config, Node1),
+    CurrentNodes = [N || {_, N} <- CurrentMembers],
+    ?assertNot(lists:member(Node3, CurrentNodes)),
+
+    %% Check we can still detect a conflict
+    Pid3 = spawn_disposable(Config, Node2),
+    {error, refuse_connection} = acq_ref_conn(Config, Node1, ?VH, ?CID2, ?USER, Pid3),
+
+    %% Cleanup
+    kill_disposable(Config, Node1, Pid1),
+    kill_disposable(Config, Node2, Pid2),
+    kill_disposable(Config, Node2, Pid3),
     ok.
 
 node_rejoins_cluster_after_graceful_shutdown(Config0) ->
