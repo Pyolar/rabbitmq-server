@@ -176,10 +176,15 @@ node_rejoins_cluster_after_graceful_shutdown(Config0) ->
     ct:pal("Members: ~p", [RecoveredMembers]),
     ?assertEqual(3, length(RecoveredMembers)),
 
+    %% Simulate a conflict with a connection on node 1
+    Pid4 = call(Config1, Node3, erlang, spawn, [fun() -> receive die -> ok end end]),
+    {error, refuse_connection} = acq_ref_conn(Config1, Node3, ?VH, ?CID1, ?USER, Pid4),
+
     %% Cleanup the dummy processes
     call(Config1, Node1, erlang, exit, [Pid1, kill]),
     call(Config1, Node2, erlang, exit, [Pid2, kill]),
     %% (Pid3 was naturally killed when Node3 was stopped)
+    call(Config1, Node3, erlang, exit, [Pid4, kill]),
     ok.
 
 node_rejoins_cluster_after_abrupt_shutdown(Config0) ->
@@ -229,6 +234,7 @@ node_rejoins_cluster_after_abrupt_shutdown(Config0) ->
     call(Config1, Node1, erlang, exit, [Pid1, kill]),
     call(Config1, Node2, erlang, exit, [Pid2, kill]),
     %% (Pid3 was naturally killed when Node3 was stopped)
+    call(Config1, Node3, erlang, exit, [Pid4, kill]),
     ok.
 
 %% --------------------------------------------------------------
