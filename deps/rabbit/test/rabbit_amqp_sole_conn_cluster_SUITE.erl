@@ -12,6 +12,7 @@
 -define(CID2, <<"id-2">>).
 -define(CID3, <<"id-3">>).
 -define(USER, <<"user-1">>).
+-define(NODE_COUNT, 3).
 
 -define(LOGFMT_CONFIG, #{legacy_header => false,
                          single_line => false,
@@ -23,6 +24,7 @@ all() ->
 groups() ->
     [{default_group, [], [
         lazy_cluster_formation,
+        cluster_should_grow_with_tick,
         node_rejoins_cluster_after_graceful_shutdown,
         node_rejoins_cluster_after_abrupt_shutdown
     ]}].
@@ -47,7 +49,7 @@ end_per_group(default_group, Config) ->
     Config.
 
 init_per_testcase(Testcase, Config0) ->
-    Nodes = start_n_nodes(Testcase, 3, Config0),
+    Nodes = start_n_nodes(Testcase, ?NODE_COUNT, Config0),
     ct:pal("Started peer nodes ~p", [Nodes]),
     
     Config1 = [{peer_nodes, Nodes} | Config0],
@@ -56,6 +58,17 @@ init_per_testcase(Testcase, Config0) ->
         fun({Node, _Peer}) ->
             setup_mocks(Config1, Node)
         end, Nodes),
+    case Testcase of
+        cluster_should_grow_with_tick ->
+            lists:foreach(
+              fun({_Node, Peer}) ->
+                      ok = peer:call(Peer, application,
+                                     set_env,
+                                     [rabbit, amqp10_sole_conn_tick_interval, 1000])
+              end, Nodes);
+        _ ->
+            ok
+    end,
     Config1.
 
 end_per_testcase(_Testcase, Config) ->
@@ -101,7 +114,7 @@ lazy_cluster_formation(Config) ->
     [Node1, Node2, Node3] = [N || {N, _Peer} <- Nodes],
     
     ct:pal("Triggering acquire/4 on Node 1 (~p)", [Node1]),
-    Pid1 = call(Config, Node1, erlang, spawn, [fun() -> receive die -> ok end end]),
+    Pid1 = spawn_disposable(Config, Node1),
     ok = acq_ref_conn(Config, Node1, ?VH, ?CID1, ?USER, Pid1),
     
     %% Verify Node 1 is the sole member
@@ -109,7 +122,7 @@ lazy_cluster_formation(Config) ->
     ?assertEqual(1, length(Members1)),
     
     ct:pal("Triggering acquire/4 on Node 2 (~p)", [Node2]),
-    Pid2 = call(Config, Node2, erlang, spawn, [fun() -> receive die -> ok end end]),
+    Pid2 = spawn_disposable(Config, Node2),
     ok = acq_ref_conn(Config, Node2, ?VH, ?CID2, ?USER, Pid2),
     
     %% Verify Node 2 joined the cluster
@@ -117,7 +130,7 @@ lazy_cluster_formation(Config) ->
     ?assertEqual(2, length(Members2)),
     
     ct:pal("Triggering acquire/4 on Node 3 (~p)", [Node3]),
-    Pid3 = call(Config, Node3, erlang, spawn, [fun() -> receive die -> ok end end]),
+    Pid3 = spawn_disposable(Config, Node3),
     ok = acq_ref_conn(Config, Node3, ?VH, ?CID3, ?USER, Pid3),
     
     %% Verify all 3 nodes are in the cluster
@@ -125,14 +138,47 @@ lazy_cluster_formation(Config) ->
     ?assertEqual(3, length(Members3)),
 
     %% Simulate a conflict with a connection on node 1
-    Pid4 = call(Config, Node3, erlang, spawn, [fun() -> receive die -> ok end end]),
+    Pid4 = spawn_disposable(Config, Node3),
     {error, refuse_connection} = acq_ref_conn(Config, Node3, ?VH, ?CID1, ?USER, Pid4),
 
     %% Cleanup the dummy processes
-    call(Config, Node1, erlang, exit, [Pid1, kill]),
-    call(Config, Node2, erlang, exit, [Pid2, kill]),
-    call(Config, Node3, erlang, exit, [Pid3, kill]),
-    call(Config, Node3, erlang, exit, [Pid4, kill]),
+    kill_disposable(Config, Node1, Pid1),
+    kill_disposable(Config, Node2, Pid2),
+    kill_disposable(Config, Node3, Pid3),
+    kill_disposable(Config, Node3, Pid4),
+    ok.
+
+cluster_should_grow_with_tick(Config) ->
+    Nodes = ?config(peer_nodes, Config),
+    [Node1, Node2, Node3] = [N || {N, _Peer} <- Nodes],
+
+    ct:pal("Triggering acquire/4 on Node 1 (~p)", [Node1]),
+    Pid1 = spawn_disposable(Config, Node1),
+    ok = acq_ref_conn(Config, Node1, ?VH, ?CID1, ?USER, Pid1),
+
+    %% Verify at least one member
+    Members1 = kh_members(Config, Node1),
+    ?assert(length(Members1) > 0),
+
+    %% Wait until all the nodes join
+    rabbit_ct_helpers:eventually(?_assert(length(kh_members(Config, Node1)) =:= ?NODE_COUNT),
+                                 1000, 10),
+
+    %% Check nodes are working as expected
+    Pid2 = spawn_disposable(Config, Node2),
+    ok = acq_ref_conn(Config, Node2, ?VH, ?CID2, ?USER, Pid2),
+    Pid3 = spawn_disposable(Config, Node3),
+    ok = acq_ref_conn(Config, Node3, ?VH, ?CID3, ?USER, Pid3),
+
+    %% Simulate a conflict with a connection on node 1
+    Pid4 = spawn_disposable(Config, Node3),
+    {error, refuse_connection} = acq_ref_conn(Config, Node3, ?VH, ?CID1, ?USER, Pid4),
+
+    %% Cleanup the dummy processes
+    kill_disposable(Config, Node1, Pid1),
+    kill_disposable(Config, Node2, Pid2),
+    kill_disposable(Config, Node3, Pid3),
+    kill_disposable(Config, Node3, Pid4),
     ok.
 
 node_rejoins_cluster_after_graceful_shutdown(Config0) ->
@@ -140,11 +186,11 @@ node_rejoins_cluster_after_graceful_shutdown(Config0) ->
     [Node1, Node2, Node3] = [N || {N, _Peer} <- Nodes],
 
     %% Form the initial cluster and write data
-    Pid1 = call(Config0, Node1, erlang, spawn, [fun() -> receive die -> ok end end]),
+    Pid1 = spawn_disposable(Config0, Node1),
     ok = acq_ref_conn(Config0, Node1, ?VH, ?CID1, ?USER, Pid1),
-    Pid2 = call(Config0, Node2, erlang, spawn, [fun() -> receive die -> ok end end]),
+    Pid2 = spawn_disposable(Config0, Node2),
     ok = acq_ref_conn(Config0, Node2, ?VH, ?CID2, ?USER, Pid2),
-    Pid3 = call(Config0, Node3, erlang, spawn, [fun() -> receive die -> ok end end]),
+    Pid3 = spawn_disposable(Config0, Node3),
     ok = acq_ref_conn(Config0, Node3, ?VH, ?CID3, ?USER, Pid3),
 
     ct:pal("Gracefully flushing Node 3 RA metadata before VM kill"),
@@ -174,17 +220,17 @@ node_rejoins_cluster_after_graceful_shutdown(Config0) ->
 
     RecoveredMembers = kh_members(Config1, Node3),
     ct:pal("Members: ~p", [RecoveredMembers]),
-    ?assertEqual(3, length(RecoveredMembers)),
+    ?assertEqual(?NODE_COUNT, length(RecoveredMembers)),
 
     %% Simulate a conflict with a connection on node 1
-    Pid4 = call(Config1, Node3, erlang, spawn, [fun() -> receive die -> ok end end]),
+    Pid4 = spawn_disposable(Config1, Node3),
     {error, refuse_connection} = acq_ref_conn(Config1, Node3, ?VH, ?CID1, ?USER, Pid4),
 
     %% Cleanup the dummy processes
-    call(Config1, Node1, erlang, exit, [Pid1, kill]),
-    call(Config1, Node2, erlang, exit, [Pid2, kill]),
+    kill_disposable(Config1, Node1, Pid1),
+    kill_disposable(Config1, Node2, Pid2),
     %% (Pid3 was naturally killed when Node3 was stopped)
-    call(Config1, Node3, erlang, exit, [Pid4, kill]),
+    kill_disposable(Config1, Node3, Pid4),
     ok.
 
 node_rejoins_cluster_after_abrupt_shutdown(Config0) ->
@@ -192,11 +238,11 @@ node_rejoins_cluster_after_abrupt_shutdown(Config0) ->
     [Node1, Node2, Node3] = [N || {N, _Peer} <- Nodes],
 
     %% Form the initial cluster and write data
-    Pid1 = call(Config0, Node1, erlang, spawn, [fun() -> receive die -> ok end end]),
+    Pid1 = spawn_disposable(Config0, Node1),
     ok = acq_ref_conn(Config0, Node1, ?VH, ?CID1, ?USER, Pid1),
-    Pid2 = call(Config0, Node2, erlang, spawn, [fun() -> receive die -> ok end end]),
+    Pid2 = spawn_disposable(Config0, Node2),
     ok = acq_ref_conn(Config0, Node2, ?VH, ?CID2, ?USER, Pid2),
-    Pid3 = call(Config0, Node3, erlang, spawn, [fun() -> receive die -> ok end end]),
+    Pid3 = spawn_disposable(Config0, Node3),
     ok = acq_ref_conn(Config0, Node3, ?VH, ?CID3, ?USER, Pid3),
 
     %% Stop Node 3 to simulate a crash/shutdown
@@ -225,16 +271,16 @@ node_rejoins_cluster_after_abrupt_shutdown(Config0) ->
     ct:pal("Members: ~p", [CurrentMembers]),
 
     %% Make sure restarted node works
-    Pid4 = call(Config1, Node3, erlang, spawn, [fun() -> receive die -> ok end end]),
+    Pid4 = spawn_disposable(Config1, Node3),
     ok = acq_ref_conn(Config1, Node3, ?VH, ?CID3, ?USER, Pid4),
     %% Make sure the system detects a conflict
     {error, refuse_connection} = acq_ref_conn(Config1, Node1, ?VH, ?CID3, ?USER, Pid1),
 
     %% Cleanup the dummy processes
-    call(Config1, Node1, erlang, exit, [Pid1, kill]),
-    call(Config1, Node2, erlang, exit, [Pid2, kill]),
+    kill_disposable(Config1, Node1, Pid1),
+    kill_disposable(Config1, Node2, Pid2),
     %% (Pid3 was naturally killed when Node3 was stopped)
-    call(Config1, Node3, erlang, exit, [Pid4, kill]),
+    kill_disposable(Config1, Node3, Pid4),
     ok.
 
 %% --------------------------------------------------------------
@@ -342,7 +388,12 @@ setup_mocks(Config, Node) ->
     %% Mock rabbit_nodes to return our 3 peers
     call(Config, Node, meck, new, [rabbit_nodes, [passthrough, no_link]]),
     call(Config, Node, meck, expect, [rabbit_nodes, list_running,
-                                      fun() -> NodeNames end]).
+                                      fun() -> NodeNames end]),
+    call(Config, Node, meck, expect, [rabbit_nodes, list_members,
+                                      fun() -> NodeNames end]),
+    call(Config, Node, meck, expect, [rabbit, is_running,
+                                      fun() -> true end]),
+    ok.
 
 node_names(Config) ->
     Nodes = ?config(peer_nodes, Config),
@@ -407,3 +458,9 @@ setup_node() ->
     ok = application:set_env(
            khepri, default_timeout, 5000, [{persistent, true}]),
     ok.
+
+spawn_disposable(Config, Node) ->
+    call(Config, Node, erlang, spawn, [fun() -> receive die -> ok end end]).
+
+kill_disposable(Config, Node, Pid) ->
+    call(Config, Node, erlang, exit, [Pid, kill]).

@@ -21,6 +21,7 @@
 -define(RA_SYSTEM, coordination).
 -define(DEFAULT_COMMAND_OPTIONS, #{reply_from => local}).
 -define(ALIVENESS_RPC_TIMEOUT, 1_000).
+-define(TICK_INTERVAL, 30_000).
 
 -rabbit_boot_step({?MODULE,
                    [{description, "AMQP 1.0 sole connection enforcement"},
@@ -37,12 +38,14 @@
          terminate/2,
          code_change/3]).
 
+%% lifecycle and store management
 -export([recover/0,
          ensure_running/0,
          get_ra_system/0,
-         get_store_id/0,
-         init_schema/0,
-         acquire/5,
+         get_store_id/0]).
+
+%% public API
+-export([acquire/5,
          refuse_connection_error/0,
          close_existing_connection_error/0]).
 
@@ -57,7 +60,8 @@
 
 -record(conn, {pid :: pid(),
                username :: username()}).
-
+%% gen_server state
+-record(state, {resizer_pid :: pid() | undefined}).
 %% --------------------------------------------------------------
 %% gen_server callbacks
 %% --------------------------------------------------------------
@@ -66,12 +70,30 @@ start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
 init([]) ->
-    erlang:send_after(10_000, self(), cluster_tick),
-    {ok, #{}}.
+    erlang:send_after(tick_interval(), self(), cluster_tick),
+    {ok, #state{resizer_pid = undefined}}.
 
-handle_info(cluster_tick, State) ->
-    erlang:send_after(10_000, self(), cluster_tick),
-    {noreply, State};
+handle_info(cluster_tick, State = #state{resizer_pid = ResizerPid}) ->
+    ?LOG_DEBUG("sole_conn cluster tick"),
+    erlang:send_after(tick_interval(), self(), cluster_tick),
+    case is_leader() of
+        true when ResizerPid =:= undefined ->
+            ?LOG_DEBUG("leader, spawning resizing process"),
+            %% We are the leader and no resize is currently running. Start one.
+            {Pid, _MonitorRef} = spawn_monitor(fun maybe_resize_cluster/0),
+            {noreply, State#state{resizer_pid = Pid}};
+        true ->
+            %% We are the leader but a resize is already running. Skip this tick.
+            ?LOG_DEBUG("Skipping sole_conn cluster resize tick, previous run still in progress"),
+            {noreply, State};
+        false ->
+            ?LOG_DEBUG("not the leader, no resizing"),
+            %% We are not the leader. Do nothing.
+            {noreply, State}
+    end;
+handle_info({'DOWN', _MRef, process, Pid, _Reason}, State = #state{resizer_pid = Pid}) ->
+    %% The resizing process finished or crashed. Clear the tracker so the next tick can run.
+    {noreply, State#state{resizer_pid = undefined}};
 handle_info(Message, State) ->
     {stop, {unhandled_info, Message}, State}.
 
@@ -86,6 +108,75 @@ terminate(_Reason, _State) ->
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
+
+%% --------------------------------------------------------------
+%% Cluster Resizing (Tick)
+%% --------------------------------------------------------------
+
+is_leader() ->
+    case ra_leaderboard:lookup_leader(get_store_id()) of
+        {_StoreId, Node} when Node =:= node() -> true;
+        _ -> false
+    end.
+
+maybe_resize_cluster() ->
+    case rabbit:is_running() of
+        true ->
+            StoreId = get_store_id(),
+            case khepri_cluster:members(StoreId, #{favor => low_latency}) of
+                {ok, Members} ->
+                    %% Extract the nodes currently in the Khepri cluster
+                    MemberNodes = [Node || {_, Node} <- Members],
+                    %% Get the state of the broader RabbitMQ cluster
+                    Present = rabbit_nodes:list_running(),
+                    RabbitNodes = rabbit_nodes:list_members(),
+                    %% Explicitly compute nodes that are allowed to be added
+                    %% They are members of the cluster and running, which is
+                    %% necessary to bootstrap the Khepri store
+                    AddableNodes = [N || N <- RabbitNodes, lists:member(N, Present)],
+                    %% Calculate nodes to add
+                    case AddableNodes -- MemberNodes of
+                        [] ->
+                            ok;
+                        [New | _] ->
+                            ?LOG_INFO("~ts: Expanding sole_conn Khepri cluster to "
+                                      "running node ~w", [?MODULE, New]),
+                           try
+                                erpc:cast(New, ?MODULE, ensure_running, [])
+                            catch
+                                Class:Reason ->
+                                    ?LOG_WARNING("~ts: Failed to cast ensure_running to node ~w. "
+                                                 "Error: ~p:~p",
+                                                 [?MODULE, New, Class, Reason])
+                            end
+                    end,
+                    %% Calculate nodes to add
+                    case MemberNodes -- RabbitNodes of
+                        [] ->
+                            ok;
+                        [Old | _] when length(RabbitNodes) > 0 ->
+                            %% This should be rare, as forget_cluster_node shrinks
+                            %% this cluster as well
+                            ?LOG_INFO("~ts: RabbitMQ node ~w was formally removed from the cluster, "
+                                      "evicting it from the sole_conn Khepri cluster",
+                                      [?MODULE, Old]),
+                            LeaderId = {StoreId, node()},
+                            ToRemove = {StoreId, Old},
+                            %% Safely remove from quorum and clean up
+                            %% disk state on the target node
+                            _ = ra:leave_and_delete_server(get_ra_system(),
+                                                           LeaderId, ToRemove),
+                            ok;
+                        _ ->
+                            ok
+                    end;
+                _ ->
+                    %% Failed to read local members, retry next tick
+                    ok
+            end;
+        false ->
+            ok
+    end.
 
 init_schema() ->
     _ = khepri_adv:put(get_store_id(),
@@ -155,6 +246,7 @@ start_local_store() ->
     StoreId = get_store_id(),
 
     %% TODO get settings from global Khepri configuration
+    %% TODO see also rabbit_stream_coordinator:make_ra_conf/3 for RA settings
     SnapshotInterval = 50000,
     RetryTimeout = 300_000,
     MachineConfig = #{snapshot_interval => SnapshotInterval},
@@ -190,7 +282,9 @@ start_local_store() ->
                             %% A violent crash may have wiped our local metadata,
                             %% but the remote cluster still remembers our old ghost identity.
                             %% We must forcibly evict our ghost from the active peer and retry.
-                            ?LOG_DEBUG("Join failed, attempting to evict ghost identity from ~p", [PeerNode]),
+                            ?LOG_DEBUG("Join failed, attempting to evict ghost "
+                                       "identity from ~p",
+                                       [PeerNode]),
                             TargetRaftNode = {StoreId, PeerNode},
                             GhostIdentity = {StoreId, node()},
 
@@ -231,6 +325,10 @@ get_ra_system() ->
 get_store_id() ->
     ?STORE_ID.
 
+%% --------------------------------------------------------------
+%% Public API
+%% --------------------------------------------------------------
+
 -spec acquire(none | enforcement_policy(), vhost(), container_id(), username(), pid()) ->
     ok | {error, refuse_connection | close_existing}.
 acquire(none, _, _, _, _) ->
@@ -238,6 +336,30 @@ acquire(none, _, _, _, _) ->
 acquire(Plcy, VHost, ContainerId, Username, ConnPid) ->
     ensure_running(),
     do_acquire(Plcy, VHost, ContainerId, Username, ConnPid).
+
+refuse_connection_error() ->
+    %% the error field of close MUST have an error with the condition field
+    %% of error being invalid-field and the info field of error having
+    %% the symbol key invalid-field taking the symbol value container-id.
+    %% [sole conn 3.2.1]
+    amqp_error(
+      ?V_1_0_AMQP_ERROR_INVALID_FIELD,
+      <<"The container-id is already bound to an "
+        "active exclusive connection.">>,
+      {?V_1_0_AMQP_ERROR_INVALID_FIELD, {symbol, <<"container-id">>}}).
+
+close_existing_connection_error() ->
+    %% "The existing connection MUST be closed with the error field of
+    %% close having the condition field of error being resource-locked.
+    %% Further the info field of error MUST contain the symbol key
+    %% sole-connection-enforcement taking the boolean value true"
+    %% [sole conn 3.2.1]
+    amqp_error(?V_1_0_AMQP_ERROR_RESOURCE_LOCKED,
+               <<"Connection closed because another "
+                 "connection with the same container-id "
+                 "was established (sole connection "
+                 "enforcement).">>,
+               {?SOLE_CONN_ENFORCEMENT, {boolean, true}}).
 
 do_acquire(refuse_connection = Plcy, VHost, ContainerId, Username, ConnPid) ->
     Path = conn_path(VHost, ContainerId),
@@ -301,30 +423,6 @@ do_acquire(close_existing = Plcy, VHost, ContainerId, Username, ConnPid) ->
                       [ContainerId, VHost, Plcy, Reason]),
             {error, refuse_connection}
     end.
-
-refuse_connection_error() ->
-    %% the error field of close MUST have an error with the condition field
-    %% of error being invalid-field and the info field of error having
-    %% the symbol key invalid-field taking the symbol value container-id.
-    %% [sole conn 3.2.1]
-    amqp_error(
-      ?V_1_0_AMQP_ERROR_INVALID_FIELD,
-      <<"The container-id is already bound to an "
-        "active exclusive connection.">>,
-      {?V_1_0_AMQP_ERROR_INVALID_FIELD, {symbol, <<"container-id">>}}).
-
-close_existing_connection_error() ->
-    %% "The existing connection MUST be closed with the error field of
-    %% close having the condition field of error being resource-locked.
-    %% Further the info field of error MUST contain the symbol key
-    %% sole-connection-enforcement taking the boolean value true"
-    %% [sole conn 3.2.1]
-    amqp_error(?V_1_0_AMQP_ERROR_RESOURCE_LOCKED,
-               <<"Connection closed because another "
-                 "connection with the same container-id "
-                 "was established (sole connection "
-                 "enforcement).">>,
-               {?SOLE_CONN_ENFORCEMENT, {boolean, true}}).
 
 %% --------------------------------------------------------------
 %% Internals
@@ -402,6 +500,10 @@ amqp_error(Cond, Desc, Info) ->
        condition = Cond,
        description = {utf8, Desc},
        info = {map, [Info]}}.
+
+tick_interval() ->
+    application:get_env(rabbit, amqp10_sole_conn_tick_interval,
+                        ?TICK_INTERVAL).
 
 %% for testing
 conn(Pid, Username) ->
