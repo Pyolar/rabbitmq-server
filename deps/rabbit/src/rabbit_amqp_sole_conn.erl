@@ -21,6 +21,7 @@
 -define(RA_SYSTEM, coordination).
 -define(TRIGGER_ID, amqp10_sole_conn_kill_connection).
 -define(DEFAULT_COMMAND_OPTIONS, #{reply_from => local}).
+-define(RPC_TIMEOUT, 30_000).
 -define(ALIVENESS_RPC_TIMEOUT, 1_000).
 -define(TICK_INTERVAL, 30_000).
 
@@ -40,7 +41,8 @@
          code_change/3]).
 
 %% lifecycle and store management
--export([recover/0,
+-export([forget_node/1,
+         recover/0,
          ensure_running/0,
          stop/0,
          get_ra_system/0,
@@ -115,6 +117,18 @@ code_change(_OldVsn, State, _Extra) ->
 %% Lifecycle and store management
 %% --------------------------------------------------------------
 
+-spec forget_node(node()) -> ok | {error, term()}.
+forget_node(Node) when is_atom(Node) ->
+    %% Check if the store was ever bootstrapped locally
+    case ra_directory:uid_of(get_ra_system(), get_store_id()) of
+        undefined ->
+            %% The store was never used on this node (lazy init), safe to skip
+            ok;
+        _ ->
+            %% Evict the node using the unified logic
+            evict_node(Node)
+    end.
+
 is_leader() ->
     case ra_leaderboard:lookup_leader(get_store_id()) of
         {_StoreId, Node} when Node =:= node() -> true;
@@ -162,22 +176,7 @@ maybe_resize_cluster() ->
                             ?LOG_INFO("~ts: RabbitMQ node ~w was formally removed from the cluster, "
                                       "evicting it from the sole_conn Khepri cluster",
                                       [?MODULE, Old]),
-                            %% Precaution: Safely stop the gen_server on the
-                            %% target node if it is still reachable
-                            try
-                                erpc:cast(Old, ?MODULE, stop, [])
-                            catch
-                                Cl:Rsn ->
-                                    ?LOG_DEBUG("~ts: Could not stop sole_conn gen_server on node ~w. "
-                                               "Error: ~p:~p",
-                                               [?MODULE, Old, Cl, Rsn])
-                            end,
-                            LeaderId = {StoreId, node()},
-                            ToRemove = {StoreId, Old},
-                            %% Safely remove from quorum and clean up
-                            %% disk state on the target node
-                            _ = ra:leave_and_delete_server(get_ra_system(),
-                                                           LeaderId, ToRemove),
+                            _ = evict_node(Old),
                             ok;
                         _ ->
                             ok
@@ -188,6 +187,69 @@ maybe_resize_cluster() ->
             end;
         false ->
             ok
+    end.
+
+evict_node(Node) ->
+    StoreId = get_store_id(),
+    %% Check if the node we want to evict is currently reachable
+    case net_adm:ping(Node) of
+        pong ->
+            %% Node is online. Safely stop our gen_server first.
+            try
+                erpc:cast(Node, ?MODULE, stop, [])
+            catch
+                Class:Reason ->
+                    ?LOG_DEBUG("~ts: Could not stop sole_conn gen_server on node ~w. "
+                               "Error: ~p:~p",
+                               [?MODULE, Node, Class, Reason])
+            end,
+            %% Ask Khepri to cleanly reset the store on that node via RPC.
+            %% This removes it from the quorum, deletes RA data,
+            %% and clears Khepri memory caches.
+            ?LOG_INFO("~ts: Target node ~w is reachable, executing Khepri reset",
+                      [?MODULE, Node]),
+            try erpc:call(Node, khepri_cluster, reset, [StoreId], ?RPC_TIMEOUT) of
+                ok ->
+                    ok;
+                {error, _} = Err ->
+                    Err
+            catch
+                error:{erpc, timeout} ->
+                    {error, timeout};
+                error:{erpc, RpcReason} ->
+                    {error, RpcReason}
+            end;
+        pang ->
+            %% Node is offline, we can ask it to reset itself.
+            %% We must forcibly shrink the quorum via the Raft leader.
+            ?LOG_INFO("~ts: Target node ~w is unreachable, forcefully removing "
+                      "from Raft quorum",
+                      [?MODULE, Node]),
+            ExpectedMembers = [{StoreId, N} || N <- rabbit_nodes:list_members()],
+            ToRemove = {StoreId, Node},
+            case ra:members(ExpectedMembers) of
+                {ok, Members, Leader} ->
+                    case lists:member(ToRemove, Members) of
+                        true ->
+                            %% ra:remove_member safely evicts the dead node
+                            %% from the consensus group
+                            case ra:remove_member(Leader, ToRemove) of
+                                {ok, _, _} ->
+                                    ok;
+                                {timeout, _} ->
+                                    {error, timeout};
+                                {error, _} = Err ->
+                                    Err
+                            end;
+                        false ->
+                            %% The node is already gone from the Raft quorum
+                            ok
+                    end;
+                {timeout, _} ->
+                    {error, timeout};
+                {error, _} = Err ->
+                    Err
+            end
     end.
 
 stop() ->
