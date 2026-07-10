@@ -27,7 +27,8 @@ groups() ->
         cluster_should_grow_with_tick,
         cluster_should_shrink_with_tick,
         node_rejoins_cluster_after_graceful_shutdown,
-        node_rejoins_cluster_after_abrupt_shutdown
+        node_rejoins_cluster_after_abrupt_shutdown,
+        forget_node_should_remove_node
     ]}].
 
 init_per_suite(Config) ->
@@ -335,6 +336,53 @@ node_rejoins_cluster_after_abrupt_shutdown(Config0) ->
     kill_disposable(Config1, Node3, Pid4),
     ok.
 
+forget_node_should_remove_node(Config) ->
+    Nodes = ?config(peer_nodes, Config),
+    [Node1, Node2, Node3] = [N || {N, _Peer} <- Nodes],
+
+    %% Form the initial cluster and write data
+    Pid1 = spawn_disposable(Config, Node1),
+    ok = acq_ref_conn(Config, Node1, ?VH, ?CID1, ?USER, Pid1),
+    Pid2 = spawn_disposable(Config, Node2),
+    ok = acq_ref_conn(Config, Node2, ?VH, ?CID2, ?USER, Pid2),
+    Pid3 = spawn_disposable(Config, Node3),
+    ok = acq_ref_conn(Config, Node3, ?VH, ?CID3, ?USER, Pid3),
+
+    ?assertEqual(?NODE_COUNT, length(kh_members(Config, Node1))),
+
+    %% Simulate 'rabbitmqctl forget_cluster_node' for Node 3
+    ct:pal("Simulating formal removal of Node 3 (~p)", [Node3]),
+    ReducedNodes = [Node1, Node2],
+    lists:foreach(
+      fun({Node, _Peer}) ->
+              %% Dynamically update the mock to pretend Node 3 was permanently removed
+              call(Config, Node, meck, expect, [rabbit_nodes, list_members, fun() -> ReducedNodes end]),
+              call(Config, Node, meck, expect, [rabbit_nodes, list_running, fun() -> ReducedNodes end])
+      end, Nodes),
+
+    ok = call(Config, Node1, ?SOLE_CONN_MOD, forget_node, [Node3]),
+
+    ?assertEqual(?NODE_COUNT - 1, length(kh_members(Config, Node1))),
+
+    %% no gen_server on node 3
+    ?assertEqual(
+       undefined,
+       call(Config, Node3, erlang, whereis, [?SOLE_CONN_MOD])
+    ),
+
+    %% The tree node from the connection on node 3 should still be in the store
+    %% so we should detect a conflict
+    Pid4 = spawn_disposable(Config, Node1),
+    {error, refuse_connection} = acq_ref_conn(Config, Node1, ?VH, ?CID3, ?USER, Pid4),
+
+    %% Cleanup the dummy processes
+    kill_disposable(Config, Node1, Pid1),
+    kill_disposable(Config, Node2, Pid2),
+    kill_disposable(Config, Node3, Pid3),
+    kill_disposable(Config, Node3, Pid4),
+    ok.
+
+
 %% --------------------------------------------------------------
 %% Internal Helpers
 %% --------------------------------------------------------------
@@ -433,6 +481,12 @@ setup_mocks(Config, Node) ->
           fun(?SOLE_CONN_MOD) ->
                   gen_server:start({local, ?SOLE_CONN_MOD},
                                    ?SOLE_CONN_MOD, [], []),
+                  ok
+          end]),
+    call(Config, Node, meck, expect,
+         [rabbit_sup, stop_child,
+          fun(?SOLE_CONN_MOD) ->
+                  gen_server:stop(?SOLE_CONN_MOD),
                   ok
           end]),
 
