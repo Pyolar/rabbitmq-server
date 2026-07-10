@@ -53,6 +53,9 @@
          refuse_connection_error/0,
          close_existing_connection_error/0]).
 
+%% CLI
+-export([status/0]).
+
 %% for testing
 -export([conn/2,
          try_put/3,
@@ -274,6 +277,65 @@ init_schema() ->
            EventFilter,
            kill_connection_sproc_path(),
            Opts).
+
+%% --------------------------------------------------------------
+%% CLI
+%% --------------------------------------------------------------
+
+-spec status() -> [[{binary(), term()}]] | {error, term()}.
+status() ->
+    case members() of
+        {ok, Members} ->
+            [begin
+                 %% Securely call ra:key_metrics/1 on the remote node
+                 MetricsResult = try
+                                     erpc:call(N, ra, key_metrics, [ServerId], ?RPC_TIMEOUT)
+                                 catch
+                                     _:Err -> {error, Err}
+                                 end,
+                 case MetricsResult of
+                     #{state := RaftState,
+                       membership := Membership,
+                       commit_index := Commit,
+                       term := Term,
+                       last_index := Last,
+                       last_applied := LastApplied,
+                       last_written_index := LastWritten,
+                       snapshot_index := SnapIdx} ->
+                         %% Optionally fetch the Khepri machine version, failing gracefully to 0
+                         MacVer = try
+                                      erpc:call(N, khepri_machine, version, [], 1000)
+                                  catch _:_ ->
+                                            0
+                                  end,
+                         [{<<"Node Name">>, N},
+                          {<<"Raft State">>, RaftState},
+                          {<<"Membership">>, Membership},
+                          {<<"Last Log Index">>, Last},
+                          {<<"Last Written">>, LastWritten},
+                          {<<"Last Applied">>, LastApplied},
+                          {<<"Commit Index">>, Commit},
+                          {<<"Snapshot Index">>, SnapIdx},
+                          {<<"Term">>, Term},
+                          {<<"Machine Version">>, MacVer}];
+                     {error, ErrReason} ->
+                         [{<<"Node Name">>, N},
+                          {<<"Raft State">>, rabbit_misc:format("~p", [ErrReason])},
+                          {<<"Membership">>, <<>>},
+                          {<<"Last Log Index">>, <<>>},
+                          {<<"Last Written">>, <<>>},
+                          {<<"Last Applied">>, <<>>},
+                          {<<"Commit Index">>, <<>>},
+                          {<<"Snapshot Index">>, <<>>},
+                          {<<"Term">>, <<>>},
+                          {<<"Machine Version">>, <<>>}]
+                 end
+             end || {_, N} = ServerId <- Members];
+        {error, {no_more_servers_to_try, _}} ->
+            {error, sole_conn_not_started_or_available};
+        {error, _} = Err ->
+            Err
+    end.
 
 %% --------------------------------------------------------------
 %% Public API
@@ -584,6 +646,28 @@ amqp_error(Cond, Desc, Info) ->
 tick_interval() ->
     application:get_env(rabbit, amqp10_sole_conn_tick_interval,
                         ?TICK_INTERVAL).
+
+%% Retrieves the Khepri members safely, even if the local store is offline
+members() ->
+    StoreId = get_store_id(),
+    LocalServerId = {StoreId, node()},
+    case whereis(?MODULE) of
+        undefined ->
+            %% The local store is not running (lazy init hasn't occurred).
+            %% Query the other reachable RabbitMQ nodes to find the Raft leader.
+            ExpectedMembers = [{StoreId, N} || N <- rabbit_nodes:list_reachable()],
+            OtherMembers = lists:delete(LocalServerId, ExpectedMembers),
+            case ra:members(OtherMembers) of
+                {ok, Members, _Leader} ->
+                    {ok, Members};
+                Err ->
+                    Err
+            end;
+        _Pid ->
+            %% The local store is running, we can use the Khepri API directly
+            khepri_cluster:members(StoreId)
+    end.
+
 
 %% for testing
 conn(Pid, Username) ->

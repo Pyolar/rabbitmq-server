@@ -28,7 +28,8 @@ groups() ->
         cluster_should_shrink_with_tick,
         node_rejoins_cluster_after_graceful_shutdown,
         node_rejoins_cluster_after_abrupt_shutdown,
-        forget_node_should_remove_node
+        forget_node_should_remove_node,
+        status_should_return_ra_metrics
     ]}].
 
 init_per_suite(Config) ->
@@ -382,6 +383,75 @@ forget_node_should_remove_node(Config) ->
     kill_disposable(Config, Node3, Pid4),
     ok.
 
+status_should_return_ra_metrics(Config) ->
+    PeerNodes = ?config(peer_nodes, Config),
+    Nodes = [Node1, Node2, Node3] = [N || {N, _Peer} <- PeerNodes],
+
+    [begin
+         ?assertEqual(
+            {error, sole_conn_not_started_or_available},
+            call(Config, Node, ?SOLE_CONN_MOD, status, [])
+           )
+     end || Node <- Nodes],
+
+
+    %% Initialize the store on one node with a request
+    Pid1 = spawn_disposable(Config, Node1),
+    ok = acq_ref_conn(Config, Node1, ?VH, ?CID1, ?USER, Pid1),
+
+    ExtractNodeName = fun(Metrics) ->
+                              proplists:get_value(<<"Node Name">>, Metrics)
+                      end,
+    ExtractNodeNames = fun(Status) ->
+                               lists:sort([ExtractNodeName(NodeMetrics) || NodeMetrics <- Status])
+                       end,
+    GetNodeNames = fun(N) ->
+                           ExtractNodeNames(call(Config, N, ?SOLE_CONN_MOD, status, []))
+                   end,
+
+    S1 = GetNodeNames(Node1),
+    ?assertEqual(1, length(S1)),
+    ?assertEqual([Node1], S1),
+    %% Same result from other nodes
+    ?assertEqual(S1, GetNodeNames(Node2)),
+    ?assertEqual(S1, GetNodeNames(Node3)),
+
+    %% Initialize the store on the second node
+    Pid2 = spawn_disposable(Config, Node2),
+    ok = acq_ref_conn(Config, Node2, ?VH, ?CID2, ?USER, Pid2),
+
+    S2 = GetNodeNames(Node1),
+    ?assertEqual(2, length(S2)),
+
+    ?assertEqual(lists:sort(Nodes -- [Node3]), S2),
+    %% Same status even from other nodes
+    ?assertEqual(S2, GetNodeNames(Node2)),
+    ?assertEqual(S2, GetNodeNames(Node3)),
+
+    %% Initialize the store on the third node
+    Pid3 = spawn_disposable(Config, Node3),
+    ok = acq_ref_conn(Config, Node3, ?VH, ?CID3, ?USER, Pid3),
+
+    S3 = GetNodeNames(Node1),
+    ?assertEqual(3, length(S3)),
+
+    ?assertEqual(lists:sort(Nodes), S3),
+    %% Same status even from other nodes
+    ?assertEqual(S3, GetNodeNames(Node2)),
+    ?assertEqual(S3, GetNodeNames(Node3)),
+
+    FinalStatus = call(Config, Node1, ?SOLE_CONN_MOD, status, []),
+    %% Check there is only one leader
+    RaftStates = [proplists:get_value(<<"Raft State">>, NodeMetrics) || NodeMetrics <- FinalStatus],
+    LeaderCount = length([S || S <- RaftStates, S =:= leader]),
+    ?assertEqual(1, LeaderCount),
+
+    %% Cleanup the dummy processes
+    kill_disposable(Config, Node1, Pid1),
+    kill_disposable(Config, Node2, Pid2),
+    kill_disposable(Config, Node3, Pid3),
+
+    ok.
 
 %% --------------------------------------------------------------
 %% Internal Helpers
@@ -496,6 +566,8 @@ setup_mocks(Config, Node) ->
     call(Config, Node, meck, expect, [rabbit_nodes, list_running,
                                       fun() -> NodeNames end]),
     call(Config, Node, meck, expect, [rabbit_nodes, list_members,
+                                      fun() -> NodeNames end]),
+    call(Config, Node, meck, expect, [rabbit_nodes, list_reachable,
                                       fun() -> NodeNames end]),
     call(Config, Node, meck, expect, [rabbit, is_running,
                                       fun() -> true end]),
