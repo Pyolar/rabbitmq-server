@@ -24,6 +24,8 @@
 -define(RPC_TIMEOUT, 30_000).
 -define(ALIVENESS_RPC_TIMEOUT, 1_000).
 -define(TICK_INTERVAL, 30_000).
+-define(JOIN_MAX_ATTEMPTS, 5).
+-define(JOIN_RETRY_BACKOFF, 1_000).
 
 -rabbit_boot_step({?MODULE,
                    [{description, "AMQP 1.0 sole connection enforcement"},
@@ -437,27 +439,7 @@ start_local_store() ->
                 PeerNode ->
                     %% Existing Cluster
                     ?LOG_DEBUG("Trying to join active peer: ~p", [PeerNode]),
-                    case khepri_cluster:join(StoreId, PeerNode) of
-                        ok ->
-                            ok;
-                        {error, _Reason} ->
-                            %% A violent crash may have wiped our local metadata,
-                            %% but the remote cluster still remembers our old ghost identity.
-                            %% We must forcibly evict our ghost from the active peer and retry.
-                            ?LOG_DEBUG("Join failed, attempting to evict ghost "
-                                       "identity from ~p",
-                                       [PeerNode]),
-                            TargetRaftNode = {StoreId, PeerNode},
-                            GhostIdentity = {StoreId, node()},
-
-                            %% Ask the active peer's RA server to remove our old identity
-                            _ = erpc:call(PeerNode, ra, remove_member,
-                                          [TargetRaftNode, GhostIdentity, RetryTimeout]),
-
-                            %% Retry the join now that the cluster views us as a clean slate
-                            ?LOG_DEBUG("Ghost evicted. Retrying join..."),
-                            ok = khepri_cluster:join(StoreId, PeerNode)
-                    end,
+                    ok = join_active_peer(StoreId, PeerNode, RaServerConfig, RetryTimeout),
 
                     ?LOG_DEBUG("Joined existing cluster, waiting for effective behaviour"),
                     ok = khepri_cluster:wait_for_effective_behaviour(
@@ -480,6 +462,63 @@ start_local_store() ->
     %% lets other nodes discover us via find_active_peer/1.
     ok = rabbit_sup:start_child(?MODULE),
     ok.
+
+join_active_peer(StoreId, PeerNode, RaServerConfig, RetryTimeout) ->
+    join_active_peer(StoreId, PeerNode, RaServerConfig, RetryTimeout, ?JOIN_MAX_ATTEMPTS).
+
+join_active_peer(_StoreId, PeerNode, _RaServerConfig, _RetryTimeout, 0) ->
+    ?LOG_ERROR("Giving up joining active peer ~p after repeated failures", [PeerNode]),
+    erlang:error({failed_to_join_peer, PeerNode});
+join_active_peer(StoreId, PeerNode, RaServerConfig, RetryTimeout, AttemptsLeft) ->
+    try join_or_evict_ghost_and_retry(StoreId, PeerNode, RetryTimeout) of
+        ok ->
+            ok;
+        {error, Reason} ->
+            retry_join_active_peer(StoreId, PeerNode, RaServerConfig, RetryTimeout,
+                                   AttemptsLeft, Reason)
+    catch
+        %% The local Ra server can end up stopped (while its Ra system and
+        %% server config are still known) if it crashed between being
+        %% restarted (as part of a failed join attempt) and the eviction of
+        %% our stale ghost identity from the remote peer: until that ghost is
+        %% evicted, the remote cluster may still address Raft messages to it.
+        error:?khepri_exception(ra_server_not_running_but_props_available, _) = Reason ->
+            retry_join_active_peer(StoreId, PeerNode, RaServerConfig, RetryTimeout,
+                                    AttemptsLeft, Reason)
+    end.
+
+retry_join_active_peer(StoreId, PeerNode, RaServerConfig, RetryTimeout, AttemptsLeft, Reason) ->
+    ?LOG_WARNING("Failed to join active peer ~p (~p), restarting local store "
+                 "and retrying (~b attempt(s) left)",
+                 [PeerNode, Reason, AttemptsLeft - 1]),
+    timer:sleep(?JOIN_RETRY_BACKOFF),
+    %% Bring the local Ra server back up (it is a no-op if it is already
+    %% running) before retrying the join.
+    {ok, _} = khepri:start(?RA_SYSTEM, RaServerConfig),
+    join_active_peer(StoreId, PeerNode, RaServerConfig, RetryTimeout, AttemptsLeft - 1).
+
+join_or_evict_ghost_and_retry(StoreId, PeerNode, RetryTimeout) ->
+    case khepri_cluster:join(StoreId, PeerNode) of
+        ok ->
+            ok;
+        {error, _Reason} ->
+            %% A violent crash may have wiped our local metadata,
+            %% but the remote cluster still remembers our old ghost identity.
+            %% We must forcibly evict our ghost from the active peer and retry.
+            ?LOG_DEBUG("Join failed, attempting to evict ghost "
+                       "identity from ~p",
+                       [PeerNode]),
+            TargetRaftNode = {StoreId, PeerNode},
+            GhostIdentity = {StoreId, node()},
+
+            %% Ask the active peer's RA server to remove our old identity
+            _ = erpc:call(PeerNode, ra, remove_member,
+                          [TargetRaftNode, GhostIdentity, RetryTimeout]),
+
+            %% Retry the join now that the cluster views us as a clean slate
+            ?LOG_DEBUG("Ghost evicted. Retrying join..."),
+            khepri_cluster:join(StoreId, PeerNode)
+    end.
 
 get_ra_system() ->
     ?RA_SYSTEM.

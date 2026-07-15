@@ -324,9 +324,15 @@ node_rejoins_cluster_after_abrupt_shutdown(Config0) ->
     CurrentMembers = kh_members(Config1, Node1),
     ct:pal("Members: ~p", [CurrentMembers]),
 
-    %% Make sure restarted node works
+    %% Make sure restarted node works.
+    %% The lazily-triggered join of the just-restarted node can transiently
+    %% crash if the remote cluster still addresses Raft messages to its
+    %% not-yet-evicted ghost identity (see rabbit_amqp_sole_conn:start_local_store/0);
+    %% retry until it succeeds instead of failing on the first attempt.
     Pid4 = spawn_disposable(Config1, Node3),
-    ok = acq_ref_conn(Config1, Node3, ?VH, ?CID3, ?USER, Pid4),
+    rabbit_ct_helpers:eventually(
+      ?_assertEqual(ok, acq_ref_conn(Config1, Node3, ?VH, ?CID3, ?USER, Pid4)),
+      1000, 15),
     %% Make sure the system detects a conflict
     {error, refuse_connection} = acq_ref_conn(Config1, Node1, ?VH, ?CID3, ?USER, Pid1),
 
