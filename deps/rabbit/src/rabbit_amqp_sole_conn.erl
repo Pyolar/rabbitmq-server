@@ -54,7 +54,8 @@
          close_existing_connection_error/0]).
 
 %% CLI
--export([status/0]).
+-export([status/0,
+         delete/2]).
 
 %% for testing
 -export([conn/2,
@@ -335,6 +336,25 @@ status() ->
             {error, sole_conn_not_started_or_available};
         {error, _} = Err ->
             Err
+    end.
+
+-spec delete(vhost(), container_id()) ->
+    ok | {error, any()}.
+delete(VHost, ContainerId) ->
+    case whereis(?MODULE) of
+        undefined ->
+            {error, sole_conn_not_started_or_available};
+        _Pid ->
+            Path = conn_path(VHost, ContainerId),
+            case khepri_adv:delete(get_store_id(), Path) of
+                {ok, Map} when map_size(Map) =:= 0 ->
+                    %% The path matched no tree node, there was nothing to delete.
+                    {error, not_found};
+                {ok, _Map} ->
+                    ok;
+                {error, _} = Err ->
+                    Err
+            end
     end.
 
 %% --------------------------------------------------------------

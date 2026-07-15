@@ -44,6 +44,8 @@ groups() ->
         close_existing_should_close_existing_connection,
         close_existing_should_refuse_different_user_and_not_kill_existing,
         try_put,
+        delete_should_remove_existing_lease,
+        delete_should_return_not_found_for_missing_lease,
         khepri_put_should_override_keep_while_monitor,
         khepri_triggers,
         khepri_cas
@@ -232,6 +234,27 @@ try_put(_) ->
     eventually(?_assertEqual(ok, acquire(refuse_connection, ?VH, ?CID1, ?USER1, Pid3))),
 
     Pid3 ! die,
+    ok.
+
+delete_should_remove_existing_lease(_) ->
+    Path = rabbit_amqp_sole_conn:conn_path(?VH, ?CID1),
+    Pid1 = spawn_disposable(),
+    ?assertEqual(ok, acquire(refuse_connection, ?VH, ?CID1, ?USER1, Pid1)),
+    ?assertMatch({ok, _}, khepri:get(get_store_id(), Path)),
+
+    ?assertEqual(ok, rabbit_amqp_sole_conn:delete(?VH, ?CID1)),
+    ?assertMatch({error, {khepri, node_not_found, _}},
+                 khepri:get(get_store_id(), Path)),
+
+    Pid1 ! die,
+    ok.
+
+delete_should_return_not_found_for_missing_lease(_) ->
+    Path = rabbit_amqp_sole_conn:conn_path(?VH, ?CID1),
+    ?assertMatch({error, {khepri, node_not_found, _}},
+                 khepri:get(get_store_id(), Path)),
+
+    ?assertEqual({error, not_found}, rabbit_amqp_sole_conn:delete(?VH, ?CID1)),
     ok.
 
 khepri_put_should_override_keep_while_monitor(_) ->
