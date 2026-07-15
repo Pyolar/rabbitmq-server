@@ -55,7 +55,7 @@
 
 %% CLI
 -export([status/0,
-         delete/2]).
+         force_delete/2]).
 
 %% for testing
 -export([conn/2,
@@ -338,9 +338,9 @@ status() ->
             Err
     end.
 
--spec delete(vhost(), container_id()) ->
+-spec force_delete(vhost(), container_id()) ->
     ok | {error, any()}.
-delete(VHost, ContainerId) ->
+force_delete(VHost, ContainerId) ->
     case whereis(?MODULE) of
         undefined ->
             {error, sole_conn_not_started_or_available};
