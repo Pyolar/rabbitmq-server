@@ -53,6 +53,9 @@ defmodule AmqpSoleConnForceDeleteCommandTest do
   end
 
   test "run: force-deleting a lease that does not exist returns an error", context do
+    node = context[:opts][:node]
+    :ok = :rpc.call(node, :rabbit_amqp_sole_conn, :ensure_running, [])
+
     assert @command.run([@container_id], context[:opts]) == {:error, :not_found}
   end
 
