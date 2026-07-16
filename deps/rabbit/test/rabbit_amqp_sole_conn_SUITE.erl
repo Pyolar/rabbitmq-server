@@ -123,6 +123,11 @@ refuse_connection_let_new_through_if_previous_died(_) ->
                  acquire(refuse_connection, ?VH, ?CID1, ?USER1, self())),
     Pid1 ! die,
     eventually(?_assertNot(is_process_alive(Pid1))),
+
+    Path = rabbit_amqp_sole_conn:conn_path(?VH, ?CID1),
+    eventually(?_assertMatch({error, {khepri, node_not_found, _}},
+                             khepri:get(get_store_id(), Path))),
+
     Pid2 = spawn_disposable(),
     ?assertEqual(ok, acquire(refuse_connection, ?VH, ?CID1, ?USER1, Pid2)),
     Pid2 ! die,
