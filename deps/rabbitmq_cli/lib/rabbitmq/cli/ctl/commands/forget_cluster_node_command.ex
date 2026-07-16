@@ -135,7 +135,7 @@ defmodule RabbitMQ.CLI.Ctl.Commands.ForgetClusterNodeCommand do
           append_err(stream_coord_result != :ok, "Stream coordinator", [])
 
         errors =
-          append_err(sole_conn_result != :ok, "AMQP sole connection", [])
+          append_err(sole_conn_result != :ok, "AMQP sole connection", errors)
 
         errors =
           append_err(has_qq_error, "Quorum queues", errors)
