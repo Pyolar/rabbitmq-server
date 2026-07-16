@@ -86,7 +86,14 @@ defmodule RabbitMQ.CLI.Ctl.Commands.ForgetClusterNodeCommand do
       :rabbit_misc.rpc_call(node_name, :rabbit_stream_coordinator, :forget_node, [atom_name])
 
     sole_conn_result =
-      :rabbit_misc.rpc_call(node_name, :rabbit_amqp_sole_conn, :forget_node, [atom_name])
+      case :rabbit_misc.rpc_call(node_name, :rabbit_amqp_sole_conn, :forget_node, [atom_name]) do
+        # For backwards compatibility
+        {:badrpc, {:EXIT, {:undef, [{:rabbit_amqp_sole_conn, :forget_node, _, _}]}}} ->
+          :ok
+
+        any ->
+          any
+      end
 
     # Now remove the node from the cluster (resets Khepri on the target)
     ret =
