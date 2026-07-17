@@ -39,8 +39,12 @@ all_tests() ->
     [
      no_sole_conn_capability_offered_if_not_desired,
      refuse_connection_no_conflict,
+     refuse_connection_no_conflict_across_vhosts,
      refuse_connection_conflict_should_refuse_new_connection,
-     close_existing_conflict_should_close_existing_connection
+     refuse_connection_conflict_different_user_should_be_refused,
+     refuse_connection_let_new_through_if_previous_closed,
+     close_existing_conflict_should_close_existing_connection,
+     close_existing_conflict_different_user_should_be_refused
     ].
 
 init_per_suite(Config) ->
@@ -142,6 +146,45 @@ refuse_connection_no_conflict(Config) ->
     ok = close_connection_sync(Connection2),
     ok = close_connection_sync(Connection1).
 
+refuse_connection_no_conflict_across_vhosts(Config) ->
+    ContainerId = atom_to_binary(?FUNCTION_NAME),
+    Vhost2 = <<ContainerId/binary, "-vhost2">>,
+    ok = rabbit_ct_broker_helpers:add_vhost(Config, Vhost2),
+    ok = rabbit_ct_broker_helpers:set_full_permissions(Config, <<"guest">>, Vhost2),
+
+    OpnConf0 = conn_config(first, Config),
+    OpnConf1 = OpnConf0#{
+                 container_id => ContainerId,
+                 desired_capabilities => [?CAP_SOLE_CONN],
+                 notify_with_performative => true
+                },
+    {ok, Connection1} = amqp10_client:open_connection(OpnConf1),
+    receive {amqp10_event, {connection, Connection1,
+                            {opened, #'v1_0.open'{
+                                        offered_capabilities = OffCaps1,
+                                        properties = Props1}}}} ->
+                assert_has_sole_cap(OffCaps1),
+                assert_has_weak_policy(Props1)
+    after 10000 -> ct:fail(opened_timeout)
+    end,
+
+    %% same container-id, same user, but a different vhost: must not
+    %% conflict, sole_conn paths are vhost-scoped
+    OpnConf2 = OpnConf1#{hostname => <<"vhost:", Vhost2/binary>>},
+    {ok, Connection2} = amqp10_client:open_connection(OpnConf2),
+    receive {amqp10_event, {connection, Connection2,
+                            {opened, #'v1_0.open'{
+                                        offered_capabilities = OffCaps2,
+                                        properties = Props2}}}} ->
+                assert_has_sole_cap(OffCaps2),
+                assert_has_weak_policy(Props2)
+    after 10000 -> ct:fail(opened_timeout)
+    end,
+
+    ok = close_connection_sync(Connection2),
+    ok = close_connection_sync(Connection1),
+    ok = rabbit_ct_broker_helpers:delete_vhost(Config, Vhost2).
+
 refuse_connection_conflict_should_refuse_new_connection(Config) ->
     ContainerId = atom_to_binary(?FUNCTION_NAME),
     %% TODO test also with explicit refuse-connection policy (it is the default)
@@ -189,6 +232,90 @@ refuse_connection_conflict_should_refuse_new_connection(Config) ->
 
     ok = close_connection_sync(Connection1).
 
+refuse_connection_conflict_different_user_should_be_refused(Config) ->
+    ContainerId = atom_to_binary(?FUNCTION_NAME),
+    OtherUser = <<ContainerId/binary, "-user2">>,
+    ok = rabbit_ct_broker_helpers:add_user(Config, OtherUser),
+    ok = rabbit_ct_broker_helpers:set_full_permissions(Config, OtherUser, <<"/">>),
+
+    OpnConf0 = conn_config(first, Config),
+    OpnConf1 = OpnConf0#{
+                 container_id => ContainerId,
+                 desired_capabilities => [?CAP_SOLE_CONN],
+                 notify_with_performative => true
+                },
+    {ok, Connection1} = amqp10_client:open_connection(OpnConf1),
+    receive {amqp10_event, {connection, Connection1,
+                            {opened, #'v1_0.open'{
+                                        offered_capabilities = OffCaps1,
+                                        properties = Props1}}}} ->
+                assert_has_sole_cap(OffCaps1),
+                assert_has_weak_policy(Props1)
+    after 10000 -> ct:fail(opened_timeout)
+    end,
+
+    %% same container-id, but a different (authenticated) user must be
+    %% refused outright, regardless of Connection1's aliveness
+    OpnConf2 = OpnConf1#{sasl => {plain, OtherUser, OtherUser}},
+    {ok, Connection2} = amqp10_client:open_connection(OpnConf2),
+    receive {amqp10_event, {connection, Connection2,
+                            {opened, #'v1_0.open'{
+                                        offered_capabilities = OffCaps2,
+                                        properties = Props2}}}} ->
+                assert_has_sole_cap(OffCaps2),
+                assert_has_weak_policy(Props2)
+    after 10000 -> ct:fail(opened_timeout)
+    end,
+    receive {amqp10_event, {connection, Connection2,
+                            {closed, #'v1_0.close'{error = Error}}}} ->
+                #'v1_0.error'{condition = Cond,
+                              description = Desc,
+                              info = {map, Info}
+                             } = Error,
+                ?assertEqual(?V_1_0_AMQP_ERROR_INVALID_FIELD, Cond),
+                ?assertEqual({utf8,
+                              <<"The container-id is already bound to "
+                                "an active exclusive connection.">>},
+                             Desc),
+                ?assert(lists:member({?V_1_0_AMQP_ERROR_INVALID_FIELD,
+                                      {symbol, <<"container-id">>}},
+                                     Info))
+    after 10000 -> ct:fail(closed_timeout)
+    end,
+
+    %% Connection1 must be left untouched
+    ok = close_connection_sync(Connection1),
+    ok = rabbit_ct_broker_helpers:delete_user(Config, OtherUser).
+
+refuse_connection_let_new_through_if_previous_closed(Config) ->
+    ContainerId = atom_to_binary(?FUNCTION_NAME),
+    OpnConf0 = conn_config(first, Config),
+    OpnConf1 = OpnConf0#{
+                 container_id => ContainerId,
+                 desired_capabilities => [?CAP_SOLE_CONN],
+                 notify_with_performative => true
+                },
+    {ok, Connection1} = amqp10_client:open_connection(OpnConf1),
+    receive {amqp10_event, {connection, Connection1,
+                            {opened, #'v1_0.open'{
+                                        offered_capabilities = OffCaps1,
+                                        properties = Props1}}}} ->
+                assert_has_sole_cap(OffCaps1),
+                assert_has_weak_policy(Props1)
+    after 10000 -> ct:fail(opened_timeout)
+    end,
+
+    ok = close_connection_sync(Connection1),
+
+    %% same container-id, same user: must be let through once the previous
+    %% connection has actually gone away broker-side. Releasing the lease
+    %% can lag slightly behind the client observing the close handshake
+    %% complete, so retry rather than assume it is immediate.
+    OpnConfConn2 = maps:merge(OpnConf1, conn_config(other, Config)),
+    Connection2 = open_connection_retry_until_accepted(OpnConfConn2, 20),
+
+    ok = close_connection_sync(Connection2).
+
 close_existing_conflict_should_close_existing_connection(Config) ->
     ContainerId = atom_to_binary(?FUNCTION_NAME),
     OpnConf0 = conn_config(first, Config),
@@ -234,6 +361,63 @@ close_existing_conflict_should_close_existing_connection(Config) ->
     end,
     ok = close_connection_sync(Connection2).
 
+close_existing_conflict_different_user_should_be_refused(Config) ->
+    ContainerId = atom_to_binary(?FUNCTION_NAME),
+    OtherUser = <<ContainerId/binary, "-user2">>,
+    ok = rabbit_ct_broker_helpers:add_user(Config, OtherUser),
+    ok = rabbit_ct_broker_helpers:set_full_permissions(Config, OtherUser, <<"/">>),
+
+    OpnConf0 = conn_config(first, Config),
+    OpnConf1 = OpnConf0#{
+                 container_id => ContainerId,
+                 desired_capabilities => [?CAP_SOLE_CONN],
+                 properties => #{?SOLE_CONN_ENFORCEMENT_POLICY_KEY =>
+                                 ?SOLE_CONN_ENFORCEMENT_POLICY_CLOSE_EXISTING},
+                 notify_with_performative => true
+                },
+    {ok, Connection1} = amqp10_client:open_connection(OpnConf1),
+    receive {amqp10_event, {connection, Connection1,
+                            {opened, #'v1_0.open'{
+                                        offered_capabilities = OffCaps1,
+                                        properties = Props1}}}} ->
+                assert_has_sole_cap(OffCaps1),
+                assert_has_weak_policy(Props1)
+    after 10000 -> ct:fail(opened_timeout)
+    end,
+
+    %% a different user must be refused outright, Connection1 must be left
+    %% untouched: close_existing only takes over a lease held by the same user
+    OpnConf2 = OpnConf1#{sasl => {plain, OtherUser, OtherUser}},
+    {ok, Connection2} = amqp10_client:open_connection(OpnConf2),
+    receive {amqp10_event, {connection, Connection2,
+                            {opened, #'v1_0.open'{
+                                        offered_capabilities = OffCaps2,
+                                        properties = Props2}}}} ->
+                assert_has_sole_cap(OffCaps2),
+                assert_has_weak_policy(Props2)
+    after 10000 -> ct:fail(opened_timeout)
+    end,
+    receive {amqp10_event, {connection, Connection2,
+                            {closed, #'v1_0.close'{error = Error}}}} ->
+                #'v1_0.error'{condition = Cond,
+                              description = Desc,
+                              info = {map, Info}
+                             } = Error,
+                ?assertEqual(?V_1_0_AMQP_ERROR_INVALID_FIELD, Cond),
+                ?assertEqual({utf8,
+                              <<"The container-id is already bound to "
+                                "an active exclusive connection.">>},
+                             Desc),
+                ?assert(lists:member({?V_1_0_AMQP_ERROR_INVALID_FIELD,
+                                      {symbol, <<"container-id">>}},
+                                     Info))
+    after 10000 -> ct:fail(closed_timeout)
+    end,
+
+    %% Connection1 must be left untouched
+    ok = close_connection_sync(Connection1),
+    ok = rabbit_ct_broker_helpers:delete_user(Config, OtherUser).
+
 %% ------------------------------------------------------------------
 %% Internal Helpers
 %% ------------------------------------------------------------------
@@ -262,4 +446,36 @@ has_field(Field, {map, Props}) ->
             false;
         _ ->
             true
+    end.
+
+%% Opens a connection and retries (with a fresh connection each time) as
+%% long as it gets refused, up to Retries attempts. Used where a previous
+%% connection holding the same container-id has just been closed: the lease
+%% release is not guaranteed to be visible yet by the time the client
+%% observes the close handshake complete.
+open_connection_retry_until_accepted(_OpnConf, 0) ->
+    ct:fail(container_id_never_released);
+open_connection_retry_until_accepted(OpnConf, Retries) ->
+    {ok, Connection} = amqp10_client:open_connection(OpnConf),
+    receive {amqp10_event, {connection, Connection,
+                            {opened, #'v1_0.open'{
+                                        offered_capabilities = OffCaps,
+                                        properties = Props}}}} ->
+                case has_field(?AMQP_ERROR_CONNECTION_ESTABLISHMENT_FAILED, Props) of
+                    false ->
+                        assert_has_sole_cap(OffCaps),
+                        assert_has_weak_policy(Props),
+                        Connection;
+                    true ->
+                        %% The server already closes a refused connection on
+                        %% its own (with an error, not `normal'), so wait for
+                        %% that instead of calling close_connection_sync/1,
+                        %% which only ever expects a `normal' close.
+                        receive {amqp10_event, {connection, Connection, {closed, _}}} -> ok
+                        after 10000 -> ok
+                        end,
+                        timer:sleep(200),
+                        open_connection_retry_until_accepted(OpnConf, Retries - 1)
+                end
+    after 10000 -> ct:fail(opened_timeout)
     end.
