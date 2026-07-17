@@ -428,7 +428,7 @@ conn_config(first, Config) ->
 conn_config(_, Config) ->
     NodeIndex = case proplists:get_value(rmq_nodes_count, Config, 1) of
         1 -> 0;
-        _ -> 1
+        Count -> rand:uniform(Count - 1)
     end,
     OpnCnf = connection_config(NodeIndex, Config),
     maps:remove(container_id, OpnCnf).
