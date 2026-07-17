@@ -57,7 +57,8 @@
 
 %% CLI
 -export([status/0,
-         force_delete/2]).
+         force_delete/2,
+         wipe/0]).
 
 %% for testing
 -export([conn/2,
@@ -67,6 +68,7 @@
 -type vhost() :: binary().
 -type container_id() :: binary().
 -type username() :: binary().
+-type wipe_status() :: ok | not_started | {error, term()}.
 
 -record(conn, {pid :: pid(),
                username :: username()}).
@@ -357,6 +359,57 @@ force_delete(VHost, ContainerId) ->
                 {error, _} = Err ->
                     Err
             end
+    end.
+
+%% Last-resort operator command (meant to be run via `rabbitmqctl eval`) to
+%% wipe the Khepri store on every cluster member, e.g. after the store got
+%% into a state it cannot recover from on its own.
+-spec wipe() -> [{node(), wipe_status()}].
+wipe() ->
+    Nodes = rabbit_nodes:list_members(),
+    ?LOG_WARNING("~ts: wiping Khepri store on nodes ~w as requested by an operator",
+                 [?MODULE, Nodes]),
+    %% Stop the gen_server (and its cluster-resizing tick) on every node
+    %% first, so no node tries to re-grow or shrink the cluster while it is
+    %% being wiped.
+    lists:foreach(fun stop_remote_gen_server/1, Nodes),
+    [{Node, reset_remote_store(Node)} || Node <- Nodes].
+
+stop_remote_gen_server(Node) ->
+    try
+        _ = erpc:call(Node, ?MODULE, stop, [], ?RPC_TIMEOUT)
+    catch
+        Class:Reason ->
+            ?LOG_WARNING("~ts: Could not stop sole_conn gen_server on node ~w "
+                         "before wipe. Error: ~p:~p",
+                         [?MODULE, Node, Class, Reason])
+    end,
+    ok.
+
+-spec reset_remote_store(node()) -> wipe_status().
+reset_remote_store(Node) ->
+    StoreId = get_store_id(),
+    RaSystem = get_ra_system(),
+    try
+        case erpc:call(Node, ra_directory, uid_of, [RaSystem, StoreId], ?RPC_TIMEOUT) of
+            undefined ->
+                %% The store was never bootstrapped on that node, nothing to reset.
+                not_started;
+            _ ->
+                case erpc:call(Node, khepri_cluster, reset, [StoreId], ?RPC_TIMEOUT) of
+                    ok ->
+                        ok;
+                    {error, _} = Err ->
+                        Err
+                end
+        end
+    catch
+        error:{erpc, timeout} ->
+            {error, timeout};
+        error:{erpc, RpcReason} ->
+            {error, RpcReason};
+        Class:Reason ->
+            {error, {Class, Reason}}
     end.
 
 %% --------------------------------------------------------------

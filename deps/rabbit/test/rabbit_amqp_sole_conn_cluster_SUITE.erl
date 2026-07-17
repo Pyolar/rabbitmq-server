@@ -29,7 +29,8 @@ groups() ->
         node_rejoins_cluster_after_graceful_shutdown,
         node_rejoins_cluster_after_abrupt_shutdown,
         forget_node_should_remove_node,
-        status_should_return_ra_metrics
+        status_should_return_ra_metrics,
+        wipe_should_reset_store_on_all_nodes
     ]}].
 
 init_per_suite(Config) ->
@@ -457,6 +458,57 @@ status_should_return_ra_metrics(Config) ->
     kill_disposable(Config, Node2, Pid2),
     kill_disposable(Config, Node3, Pid3),
 
+    ok.
+
+wipe_should_reset_store_on_all_nodes(Config) ->
+    Nodes = ?config(peer_nodes, Config),
+    [Node1, Node2, Node3] = AllNodes = [N || {N, _Peer} <- Nodes],
+
+    %% Form the initial cluster and write data
+    Pid1 = spawn_disposable(Config, Node1),
+    ok = acq_ref_conn(Config, Node1, ?VH, ?CID1, ?USER, Pid1),
+    Pid2 = spawn_disposable(Config, Node2),
+    ok = acq_ref_conn(Config, Node2, ?VH, ?CID2, ?USER, Pid2),
+    Pid3 = spawn_disposable(Config, Node3),
+    ok = acq_ref_conn(Config, Node3, ?VH, ?CID3, ?USER, Pid3),
+
+    ?assertEqual(?NODE_COUNT, length(kh_members(Config, Node1))),
+
+    ct:pal("Wiping the sole_conn Khepri store from Node 1 (~p)", [Node1]),
+    WipeResult = call(Config, Node1, ?SOLE_CONN_MOD, wipe, []),
+    ?assertEqual(
+       lists:sort([{N, ok} || N <- AllNodes]),
+       lists:sort(WipeResult)),
+
+    %% The wiped-out connections' pids are no longer relevant
+    kill_disposable(Config, Node1, Pid1),
+    kill_disposable(Config, Node2, Pid2),
+    kill_disposable(Config, Node3, Pid3),
+
+    lists:foreach(
+      fun(Node) ->
+              ?assertEqual(
+                 undefined,
+                 call(Config, Node, erlang, whereis, [?SOLE_CONN_MOD])),
+              ?assertEqual(
+                 undefined,
+                 call(Config, Node, ra_directory, uid_of, [coordination, ?STORE_ID]))
+      end, AllNodes),
+
+    %% The system must be able to bootstrap from scratch again
+    Pid1b = spawn_disposable(Config, Node1),
+    ok = acq_ref_conn(Config, Node1, ?VH, ?CID1, ?USER, Pid1b),
+    Pid2b = spawn_disposable(Config, Node2),
+    ok = acq_ref_conn(Config, Node2, ?VH, ?CID2, ?USER, Pid2b),
+    Pid3b = spawn_disposable(Config, Node3),
+    ok = acq_ref_conn(Config, Node3, ?VH, ?CID3, ?USER, Pid3b),
+
+    ?assertEqual(?NODE_COUNT, length(kh_members(Config, Node1))),
+
+    %% Cleanup the dummy processes
+    kill_disposable(Config, Node1, Pid1b),
+    kill_disposable(Config, Node2, Pid2b),
+    kill_disposable(Config, Node3, Pid3b),
     ok.
 
 %% --------------------------------------------------------------
