@@ -26,6 +26,8 @@
 -define(TICK_INTERVAL, 30_000).
 -define(JOIN_MAX_ATTEMPTS, 5).
 -define(JOIN_RETRY_BACKOFF, 1_000).
+-define(RESIZE_POLL_INTERVAL, 500).
+-define(BOOTSTRAP_LOCK, {?MODULE, bootstrap}).
 
 -rabbit_boot_step({?MODULE,
                    [{description, "AMQP 1.0 sole connection enforcement"},
@@ -47,6 +49,7 @@
          recover/0,
          ensure_running/0,
          stop/0,
+         is_resizing/0,
          get_ra_system/0,
          get_store_id/0]).
 
@@ -109,6 +112,8 @@ handle_info({'DOWN', _MRef, process, Pid, _Reason}, State = #state{resizer_pid =
 handle_info(Message, State) ->
     {stop, {unhandled_info, Message}, State}.
 
+handle_call(is_resizing, _From, State = #state{resizer_pid = ResizerPid}) ->
+    {reply, ResizerPid =/= undefined, State};
 handle_call(Request, _From, State) ->
     {stop, {unhandled_call, Request}, State}.
 
@@ -266,6 +271,10 @@ stop() ->
     _ = rabbit_sup:stop_child(?MODULE),
     ok.
 
+-spec is_resizing() -> boolean().
+is_resizing() ->
+    gen_server:call(?MODULE, is_resizing).
+
 init_schema() ->
     _ = khepri_adv:put(get_store_id(),
                        kill_connection_sproc_path(),
@@ -369,11 +378,45 @@ wipe() ->
     Nodes = rabbit_nodes:list_members(),
     ?LOG_WARNING("~ts: wiping Khepri store on nodes ~w as requested by an operator",
                  [?MODULE, Nodes]),
-    %% Stop the gen_server (and its cluster-resizing tick) on every node
-    %% first, so no node tries to re-grow or shrink the cluster while it is
-    %% being wiped.
-    lists:foreach(fun stop_remote_gen_server/1, Nodes),
-    [{Node, reset_remote_store(Node)} || Node <- Nodes].
+    global:set_lock(?BOOTSTRAP_LOCK),
+    try
+        %% For each node, wait for its resizer process to settle and stop its
+        %% gen_server (disabling the cluster-resizing tick) right after,
+        %% before moving to the next node.
+        lists:foreach(fun disable_tick/1, Nodes),
+        [{Node, reset_remote_store(Node)} || Node <- Nodes]
+    after
+        global:del_lock(?BOOTSTRAP_LOCK)
+    end.
+
+disable_tick(Node) ->
+    Deadline = erlang:monotonic_time(millisecond) + ?RPC_TIMEOUT,
+    wait_for_resize_to_settle(Node, Deadline),
+    stop_remote_gen_server(Node).
+
+wait_for_resize_to_settle(Node, Deadline) ->
+    case is_resizing_remote(Node) of
+        true ->
+            case erlang:monotonic_time(millisecond) >= Deadline of
+                true ->
+                    ?LOG_WARNING("~ts: Node ~w is still resizing the sole_conn "
+                                 "Khepri cluster after waiting, proceeding with "
+                                 "wipe anyway", [?MODULE, Node]);
+                false ->
+                    timer:sleep(?RESIZE_POLL_INTERVAL),
+                    wait_for_resize_to_settle(Node, Deadline)
+            end;
+        false ->
+            ok
+    end.
+
+is_resizing_remote(Node) ->
+    try erpc:call(Node, ?MODULE, is_resizing, [], ?ALIVENESS_RPC_TIMEOUT) of
+        Result -> Result
+    catch
+        %% Not running, unreachable, or otherwise gone: nothing to wait for.
+        _:_ -> false
+    end.
 
 stop_remote_gen_server(Node) ->
     try
@@ -439,11 +482,11 @@ ensure_running() ->
         undefined ->
             ?LOG_DEBUG("sole_conn not running on ~p, "
                        "trying to acquire bootstrap lock", [node()]),
-            global:set_lock({?MODULE, bootstrap}),
+            global:set_lock(?BOOTSTRAP_LOCK),
             try
                 case whereis(?MODULE) of
                     undefined ->
-                        start_local_store(); 
+                        start_local_store();
                     _Pid ->
                         ?LOG_DEBUG("sole_conn has started on ~p, skipping bootstrap sequence",
                                    [node()]),
@@ -451,7 +494,7 @@ ensure_running() ->
                 end
             after
                 %% Lock is released even if an exception occurs
-                global:del_lock({?MODULE, bootstrap})
+                global:del_lock(?BOOTSTRAP_LOCK)
             end;
         _ ->
             ok
