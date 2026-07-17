@@ -30,7 +30,8 @@ groups() ->
         node_rejoins_cluster_after_abrupt_shutdown,
         forget_node_should_remove_node,
         status_should_return_ra_metrics,
-        wipe_should_reset_store_on_all_nodes
+        wipe_should_reset_store_on_all_nodes,
+        start_should_bootstrap_store_on_all_nodes
     ]}].
 
 init_per_suite(Config) ->
@@ -495,7 +496,22 @@ wipe_should_reset_store_on_all_nodes(Config) ->
                  call(Config, Node, ra_directory, uid_of, [coordination, ?STORE_ID]))
       end, AllNodes),
 
-    %% The system must be able to bootstrap from scratch again
+    %% The system must be able to bootstrap from scratch again, using the
+    %% eager start/0 operator command rather than waiting for the first
+    %% acquire/5 call to trigger the lazy bootstrap on each node
+    ct:pal("Starting the sole_conn Khepri store from Node 1 (~p)", [Node1]),
+    StartResult = call(Config, Node1, ?SOLE_CONN_MOD, start, []),
+    ?assertEqual(
+       lists:sort([{N, ok} || N <- AllNodes]),
+       lists:sort(StartResult)),
+
+    lists:foreach(
+      fun(Node) ->
+              ?assert(is_pid(call(Config, Node, erlang, whereis, [?SOLE_CONN_MOD])))
+      end, AllNodes),
+    ?assertEqual(?NODE_COUNT, length(kh_members(Config, Node1))),
+
+    %% Check the restarted store is functional
     Pid1b = spawn_disposable(Config, Node1),
     ok = acq_ref_conn(Config, Node1, ?VH, ?CID1, ?USER, Pid1b),
     Pid2b = spawn_disposable(Config, Node2),
@@ -503,12 +519,54 @@ wipe_should_reset_store_on_all_nodes(Config) ->
     Pid3b = spawn_disposable(Config, Node3),
     ok = acq_ref_conn(Config, Node3, ?VH, ?CID3, ?USER, Pid3b),
 
-    ?assertEqual(?NODE_COUNT, length(kh_members(Config, Node1))),
-
     %% Cleanup the dummy processes
     kill_disposable(Config, Node1, Pid1b),
     kill_disposable(Config, Node2, Pid2b),
     kill_disposable(Config, Node3, Pid3b),
+    ok.
+
+start_should_bootstrap_store_on_all_nodes(Config) ->
+    Nodes = ?config(peer_nodes, Config),
+    [Node1, Node2, Node3] = AllNodes = [N || {N, _Peer} <- Nodes],
+
+    %% Nothing has called acquire yet, so the store was never bootstrapped
+    %% on any node
+    lists:foreach(
+      fun(Node) ->
+              ?assertEqual(
+                 undefined,
+                 call(Config, Node, erlang, whereis, [?SOLE_CONN_MOD]))
+      end, AllNodes),
+
+    ct:pal("Starting the sole_conn Khepri store from Node 1 (~p)", [Node1]),
+    StartResult = call(Config, Node1, ?SOLE_CONN_MOD, start, []),
+    ?assertEqual(
+       lists:sort([{N, ok} || N <- AllNodes]),
+       lists:sort(StartResult)),
+
+    lists:foreach(
+      fun(Node) ->
+              ?assert(is_pid(call(Config, Node, erlang, whereis, [?SOLE_CONN_MOD])))
+      end, AllNodes),
+    ?assertEqual(?NODE_COUNT, length(kh_members(Config, Node1))),
+
+    %% Check the store is functional on every node
+    Pid1 = spawn_disposable(Config, Node1),
+    ok = acq_ref_conn(Config, Node1, ?VH, ?CID1, ?USER, Pid1),
+    Pid2 = spawn_disposable(Config, Node2),
+    ok = acq_ref_conn(Config, Node2, ?VH, ?CID2, ?USER, Pid2),
+    Pid3 = spawn_disposable(Config, Node3),
+    ok = acq_ref_conn(Config, Node3, ?VH, ?CID3, ?USER, Pid3),
+
+    %% Simulate a conflict with a connection on node 1
+    Pid4 = spawn_disposable(Config, Node3),
+    {error, refuse_connection} = acq_ref_conn(Config, Node3, ?VH, ?CID1, ?USER, Pid4),
+
+    %% Cleanup the dummy processes
+    kill_disposable(Config, Node1, Pid1),
+    kill_disposable(Config, Node2, Pid2),
+    kill_disposable(Config, Node3, Pid3),
+    kill_disposable(Config, Node3, Pid4),
     ok.
 
 %% --------------------------------------------------------------

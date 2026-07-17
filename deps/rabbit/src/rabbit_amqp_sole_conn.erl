@@ -61,6 +61,7 @@
 %% CLI
 -export([status/0,
          force_delete/2,
+         start/0,
          wipe/0]).
 
 %% for testing
@@ -72,6 +73,7 @@
 -type container_id() :: binary().
 -type username() :: binary().
 -type wipe_status() :: ok | not_started | {error, term()}.
+-type start_status() :: ok | {error, term()}.
 
 -record(conn, {pid :: pid(),
                username :: username()}).
@@ -446,6 +448,32 @@ reset_remote_store(Node) ->
                         Err
                 end
         end
+    catch
+        error:{erpc, timeout} ->
+            {error, timeout};
+        error:{erpc, RpcReason} ->
+            {error, RpcReason};
+        Class:Reason ->
+            {error, {Class, Reason}}
+    end.
+
+%% Operator command (meant to be run via `rabbitmqctl eval`) to eagerly
+%% bootstrap the Khepri store on every listed cluster member, instead of
+%% relying on the store being lazily started by the first `acquire' call on
+%% each node. Best-effort like wipe/0: one node failing to start does not
+%% stop the others from being attempted.
+-spec start() -> [{node(), start_status()}].
+start() ->
+    Nodes = rabbit_nodes:list_members(),
+    ?LOG_INFO("~ts: starting the sole_conn Khepri store on nodes ~w "
+              "as requested by an operator",
+              [?MODULE, Nodes]),
+    [{Node, start_remote(Node)} || Node <- Nodes].
+
+-spec start_remote(node()) -> start_status().
+start_remote(Node) ->
+    try
+        ok = erpc:call(Node, ?MODULE, ensure_running, [], ?RPC_TIMEOUT)
     catch
         error:{erpc, timeout} ->
             {error, timeout};
