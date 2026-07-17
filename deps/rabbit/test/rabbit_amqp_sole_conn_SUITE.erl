@@ -48,7 +48,9 @@ groups() ->
         force_delete_should_return_not_found_for_missing_lease,
         khepri_put_should_override_keep_while_monitor,
         khepri_triggers,
-        khepri_cas
+        khepri_cas,
+        acquire_with_none_policy_should_always_succeed,
+        refuse_connection_should_return_refuse_connection_on_unexpected_khepri_error
       ]}
     ].
 
@@ -104,6 +106,9 @@ init_per_testcase(_, Config) ->
 
 end_per_testcase(_, Config) ->
     clean_store_from_connections(),
+    %% Defensive cleanup in case a testcase-local mock was left behind by a
+    %% failed assertion before it could unload it.
+    try meck:unload(khepri_adv) catch _:_ -> ok end,
     Config.
 
 refuse_connection_should_refuse_new_connection_if_conflict(_) ->
@@ -349,6 +354,30 @@ khepri_cas(_) ->
     ?assertMatch({error, _}, khepri:get(StoreId, Path)),
     ?assertMatch({error, _},
                  khepri:compare_and_swap(StoreId, Path, V1, V2)),
+    ok.
+
+acquire_with_none_policy_should_always_succeed(_) ->
+    Pid1 = spawn_disposable(),
+    ?assertEqual(ok, acquire(none, ?VH, ?CID1, ?USER1, Pid1)),
+    %% a conflicting acquire, even from a different user, must also succeed:
+    %% the `none' policy short-circuits before any Khepri lookup
+    Pid2 = spawn_disposable(),
+    ?assertEqual(ok, acquire(none, ?VH, ?CID1, ?USER2, Pid2)),
+    Pid1 ! die,
+    Pid2 ! die,
+    ok.
+
+refuse_connection_should_return_refuse_connection_on_unexpected_khepri_error(_) ->
+    ok = meck:new(khepri_adv, [passthrough, no_link]),
+    ok = meck:expect(khepri_adv, create,
+                     fun(_StoreId, _Path, _Payload, _Opts) ->
+                             {error, some_unexpected_reason}
+                     end),
+    Pid1 = spawn_disposable(),
+    ?assertEqual({error, refuse_connection},
+                 acquire(refuse_connection, ?VH, ?CID1, ?USER1, Pid1)),
+    ok = meck:unload(khepri_adv),
+    Pid1 ! die,
     ok.
 
 %% --------------------------------------------------------------

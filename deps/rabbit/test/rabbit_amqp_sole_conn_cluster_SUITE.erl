@@ -31,7 +31,8 @@ groups() ->
         forget_node_should_remove_node,
         status_should_return_ra_metrics,
         wipe_should_reset_store_on_all_nodes,
-        start_should_bootstrap_store_on_all_nodes
+        start_should_bootstrap_store_on_all_nodes,
+        conflict_should_resolve_when_existing_conns_node_is_unreachable
     ]}].
 
 init_per_suite(Config) ->
@@ -86,10 +87,18 @@ end_per_testcase(_Testcase, Config) ->
                 _:_ -> ok 
             end,
             
-            try 
-                call(Config, Node, meck, unload, [rabbit_sup]) 
-            catch 
-                _:_ -> ok 
+            try
+                call(Config, Node, meck, unload, [rabbit_sup])
+            catch
+                _:_ -> ok
+            end,
+
+            %% Defensive cleanup in case a testcase-local mock was left
+            %% behind by a failed assertion before it could unload it.
+            try
+                call(Config, Node, meck, unload, [erpc])
+            catch
+                _:_ -> ok
             end
         end, Nodes),
     lists:foreach(
@@ -567,6 +576,43 @@ start_should_bootstrap_store_on_all_nodes(Config) ->
     kill_disposable(Config, Node2, Pid2),
     kill_disposable(Config, Node3, Pid3),
     kill_disposable(Config, Node3, Pid4),
+    ok.
+
+conflict_should_resolve_when_existing_conns_node_is_unreachable(Config) ->
+    Nodes = ?config(peer_nodes, Config),
+    [Node1, Node2, _Node3] = [N || {N, _Peer} <- Nodes],
+
+    %% Acquire a lease on Node1
+    Pid1 = spawn_disposable(Config, Node1),
+    ok = acq_ref_conn(Config, Node1, ?VH, ?CID1, ?USER, Pid1),
+
+    %% Simulate what a real network partition looks like from Node2's point
+    %% of view: the cross-node liveness check for Pid1 (on Node1) fails,
+    %% even though Pid1 is genuinely still alive. This is exactly what
+    %% check_conn/1 sees when the node hosting the existing connection
+    %% becomes unreachable.
+    call(Config, Node2, meck, new, [erpc, [passthrough, unstick, no_link]]),
+    call(Config, Node2, meck, expect,
+         [erpc, call,
+          fun(Node, erlang, is_process_alive, [Pid], _Timeout)
+                when Node =:= Node1, Pid =:= Pid1 ->
+                  erlang:error({erpc, noconnection});
+             (N, M, F, A, T) ->
+                  meck:passthrough([N, M, F, A, T])
+          end]),
+
+    ?assert(call(Config, Node1, erlang, is_process_alive, [Pid1])),
+
+    %% A conflicting acquire from Node2 must succeed: Node2 cannot verify
+    %% Pid1 is alive, so it treats the existing lease as dead and takes over
+    Pid2 = spawn_disposable(Config, Node2),
+    ?assertEqual(ok, acq_ref_conn(Config, Node2, ?VH, ?CID1, ?USER, Pid2)),
+
+    call(Config, Node2, meck, unload, [erpc]),
+
+    %% Cleanup the dummy processes
+    kill_disposable(Config, Node1, Pid1),
+    kill_disposable(Config, Node2, Pid2),
     ok.
 
 %% --------------------------------------------------------------
